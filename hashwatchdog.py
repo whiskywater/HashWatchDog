@@ -36,13 +36,13 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
 PROGRAM_NAME = "hashwatchdog"
-VERSION = "2.0.0"
+VERSION = "2.2.0"
 SCHEMA_VERSION = 2
 DEFAULT_CHUNK_MIB = 8
 DEFAULT_PROGRESS_SECONDS = 5.0
 DEFAULT_FILE_PROGRESS_SECONDS = 10.0
 DEFAULT_QUEUE_MULTIPLIER = 4
-COMMIT_SECONDS = 2.0
+COMMIT_SECONDS = 30.0
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
@@ -353,6 +353,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help="Resume a compatible interrupted scan from hash_index.sqlite3.partial.",
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help=(
+            "Generate reports from an existing partial or completed SQLite database "
+            "without walking or hashing the filesystem."
+        ),
     )
     parser.add_argument(
         "--incremental",
@@ -1581,92 +1589,184 @@ def atomic_replace(temp_path: Path, final_path: Path) -> None:
         pass
 
 
+
+@contextlib.contextmanager
+def report_phase(logger: logging.Logger, name: str) -> Iterator[dict[str, float]]:
+    """Log a report phase and emit a warning if one SQL operation runs for a long time."""
+    started = time.monotonic()
+    stopped = threading.Event()
+
+    def watchdog() -> None:
+        while not stopped.wait(60.0):
+            logger.warning(
+                "Report phase still working: %s | elapsed %.1f seconds",
+                name,
+                time.monotonic() - started,
+            )
+
+    thread = threading.Thread(
+        target=watchdog,
+        name=f"report-watchdog-{name.replace(' ', '-')}",
+        daemon=True,
+    )
+    logger.info("Report phase: %s", name)
+    thread.start()
+    timing: dict[str, float] = {"elapsed": 0.0}
+    try:
+        yield timing
+    finally:
+        stopped.set()
+        thread.join(timeout=1.0)
+        timing["elapsed"] = max(time.monotonic() - started, 0.0)
+        logger.info("Report phase complete: %s | %.2f seconds", name, timing["elapsed"])
+
+
+def progress_due(
+    processed: int,
+    last_processed: int,
+    now: float,
+    last_logged: float,
+    row_interval: int = 50_000,
+    time_interval: float = 5.0,
+) -> bool:
+    return processed - last_processed >= row_interval or now - last_logged >= time_interval
+
+
+def prepare_reporting_database(
+    connection: sqlite3.Connection,
+    logger: logging.Logger,
+) -> float:
+    """Checkpoint the ingestion WAL and refresh planner statistics once."""
+    with report_phase(logger, "preparing SQLite for reporting") as timing:
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("PRAGMA optimize")
+        connection.commit()
+    return timing["elapsed"]
+
+
 def generate_all_hashes_csv(
     connection: sqlite3.Connection,
     scan_id: str,
     temp_path: Path,
-) -> None:
-    with restrictive_umask(), open(
-        temp_path,
-        "w",
-        newline="",
-        encoding="utf-8",
-        errors="backslashreplace",
-    ) as handle:
-        writer = csv.writer(handle)
-        writer.writerow(
-            (
-                "scan_id",
-                "root",
-                "path",
-                "path_bytes_hex",
-                "apparent_size_bytes",
-                "allocated_size_bytes",
-                "sparse",
-                "mtime_utc",
-                "ctime_utc",
-                "hash",
-                "sample_hash",
-                "algorithm",
-                "status",
-                "error",
-                "logical_bytes_read",
-                "elapsed_seconds",
-                "device",
-                "inode",
-                "management_class",
-                "classification_confidence",
-                "classification_reason",
-                "cleanup_risk",
-                "reused_from_file_id",
-            )
-        )
-        rows = connection.execute(
-            """
-            SELECT f.*, r.path_display AS root_display
-            FROM files f JOIN roots r ON r.id=f.root_id
-            WHERE f.scan_id=?
-            ORDER BY f.path_display
-            """,
-            (scan_id,),
-        )
-        for row in rows:
-            allocated = row["allocated_bytes"]
-            apparent = row["size_bytes"]
-            sparse = (
-                "yes"
-                if allocated is not None and apparent is not None and allocated < apparent
-                else "no"
-            )
+    logger: logging.Logger,
+) -> tuple[int, float]:
+    total_row = connection.execute(
+        "SELECT COUNT(*) AS count FROM files WHERE scan_id=?", (scan_id,)
+    ).fetchone()
+    total = int(total_row["count"] if total_row else 0)
+
+    with report_phase(logger, f"exporting all-file inventory ({total} rows)") as timing:
+        with restrictive_umask(), open(
+            temp_path,
+            "w",
+            newline="",
+            encoding="utf-8",
+            errors="backslashreplace",
+        ) as handle:
+            writer = csv.writer(handle)
             writer.writerow(
                 (
-                    scan_id,
-                    row["root_display"],
-                    row["path_display"],
-                    bytes(row["path_raw"]).hex(),
-                    "" if apparent is None else apparent,
-                    "" if allocated is None else allocated,
-                    sparse,
-                    utc_timestamp(row["mtime_ns"]),
-                    utc_timestamp(row["ctime_ns"]),
-                    row["digest"],
-                    row["sample_digest"],
-                    row["algorithm"],
-                    row["status"],
-                    row["error"],
-                    row["bytes_read"],
-                    f"{row['elapsed_seconds']:.6f}",
-                    "" if row["device"] is None else row["device"],
-                    "" if row["inode"] is None else row["inode"],
-                    row["management_class"],
-                    row["classification_confidence"],
-                    row["classification_reason"],
-                    row["cleanup_risk"],
-                    "" if row["reused_from_file_id"] is None else row["reused_from_file_id"],
+                    "scan_id",
+                    "root",
+                    "path",
+                    "path_bytes_hex",
+                    "apparent_size_bytes",
+                    "allocated_size_bytes",
+                    "sparse",
+                    "mtime_utc",
+                    "ctime_utc",
+                    "hash",
+                    "sample_hash",
+                    "algorithm",
+                    "status",
+                    "error",
+                    "logical_bytes_read",
+                    "elapsed_seconds",
+                    "device",
+                    "inode",
+                    "management_class",
+                    "classification_confidence",
+                    "classification_reason",
+                    "cleanup_risk",
+                    "reused_from_file_id",
                 )
             )
-        fsync_file(handle)
-    os.chmod(temp_path, 0o600)
+            rows = connection.execute(
+                """
+                SELECT f.*, r.path_display AS root_display
+                FROM files AS f
+                JOIN roots AS r ON r.id=f.root_id
+                WHERE f.scan_id=?
+                ORDER BY f.path_display, f.id
+                """,
+                (scan_id,),
+            )
+            processed = 0
+            last_processed = 0
+            last_logged = time.monotonic()
+            for row in rows:
+                allocated = row["allocated_bytes"]
+                apparent = row["size_bytes"]
+                sparse = (
+                    "yes"
+                    if allocated is not None and apparent is not None and allocated < apparent
+                    else "no"
+                )
+                writer.writerow(
+                    (
+                        scan_id,
+                        row["root_display"],
+                        row["path_display"],
+                        bytes(row["path_raw"]).hex(),
+                        "" if apparent is None else apparent,
+                        "" if allocated is None else allocated,
+                        sparse,
+                        utc_timestamp(row["mtime_ns"]),
+                        utc_timestamp(row["ctime_ns"]),
+                        row["digest"],
+                        row["sample_digest"],
+                        row["algorithm"],
+                        row["status"],
+                        row["error"],
+                        row["bytes_read"],
+                        f"{row['elapsed_seconds']:.6f}",
+                        "" if row["device"] is None else row["device"],
+                        "" if row["inode"] is None else row["inode"],
+                        row["management_class"],
+                        row["classification_confidence"],
+                        row["classification_reason"],
+                        row["cleanup_risk"],
+                        "" if row["reused_from_file_id"] is None else row["reused_from_file_id"],
+                    )
+                )
+                processed += 1
+                now = time.monotonic()
+                if progress_due(processed, last_processed, now, last_logged):
+                    logger.info(
+                        "Report progress: all-file inventory | %d / %d rows",
+                        processed,
+                        total,
+                    )
+                    last_processed = processed
+                    last_logged = now
+            fsync_file(handle)
+        os.chmod(temp_path, 0o600)
+    return processed, timing["elapsed"]
+
+
+def _risk_from_rank(rank: int) -> str:
+    return {0: "low", 1: "medium", 2: "high", 3: "critical"}.get(rank, "medium")
+
+
+def _drop_report_temp_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        DROP TABLE IF EXISTS temp.report_eligible_files;
+        DROP TABLE IF EXISTS temp.report_physical_copies;
+        DROP TABLE IF EXISTS temp.report_duplicate_groups;
+        """
+    )
 
 
 def generate_duplicate_csv(
@@ -1677,7 +1777,8 @@ def generate_duplicate_csv(
     temp_path: Path,
     logger: logging.Logger,
     log_detail: str,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, float]]:
+    """Build duplicate statistics set-wise and stream all paths with one joined query."""
     summary = {
         "groups": 0,
         "cleanup_groups": 0,
@@ -1687,147 +1788,255 @@ def generate_duplicate_csv(
         "estimated_reclaimable_min_bytes": 0,
         "estimated_reclaimable_max_bytes": 0,
     }
+    timings: dict[str, float] = {}
+    statuses = "('ok','reused','empty_reported')" if empty_policy == "report" else "('ok','reused')"
 
-    status_filter = "('ok','reused')"
-    if empty_policy == "report":
-        status_filter = "('ok','reused','empty_reported')"
-
-    group_sql = f"""
-        SELECT digest, size_bytes, COUNT(*) AS path_count,
-               COUNT(DISTINCT CAST(device AS TEXT) || ':' || CAST(inode AS TEXT))
-                   AS physical_copy_count
-        FROM files
-        WHERE scan_id=? AND status IN {status_filter} AND digest <> ''
-        GROUP BY digest, size_bytes
-        HAVING COUNT(*) > 1
-        ORDER BY size_bytes DESC, path_count DESC, digest
-    """
-
-    with restrictive_umask(), open(
-        temp_path,
-        "w",
-        newline="",
-        encoding="utf-8",
-        errors="backslashreplace",
-    ) as handle:
-        writer = csv.writer(handle)
-        writer.writerow(
-            (
-                "duplicate_group",
-                "group_kind",
-                "cleanup_candidate",
-                "algorithm",
-                "hash",
-                "apparent_size_bytes",
-                "path_count",
-                "physical_copy_count",
-                "logical_duplicate_bytes",
-                "total_unique_allocated_bytes",
-                "estimated_reclaimable_min_bytes",
-                "estimated_reclaimable_max_bytes",
-                "contains_sparse_file",
-                "same_physical_file_only",
-                "group_cleanup_risk",
-                "root",
-                "path",
-                "path_bytes_hex",
-                "allocated_size_bytes",
-                "device",
-                "inode",
-                "mtime_utc",
-                "ctime_utc",
-                "management_class",
-                "classification_confidence",
-                "classification_reason",
-                "cleanup_risk",
-            )
+    _drop_report_temp_tables(connection)
+    with report_phase(logger, "materializing duplicate candidates") as timing:
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE report_eligible_files AS
+            SELECT
+                id, root_id, path_display, path_raw, size_bytes, allocated_bytes,
+                mtime_ns, ctime_ns, device, inode, digest,
+                management_class, classification_confidence,
+                classification_reason, cleanup_risk
+            FROM files
+            WHERE scan_id=? AND status IN {statuses} AND digest <> ''
+            """,
+            (scan_id,),
         )
+        connection.executescript(
+            """
+            CREATE INDEX temp.idx_report_eligible_group
+                ON report_eligible_files(digest, size_bytes);
+            CREATE INDEX temp.idx_report_eligible_stream
+                ON report_eligible_files(digest, size_bytes, path_display, id);
 
-        group_cursor = connection.execute(group_sql, (scan_id,))
-        for group_number, group in enumerate(group_cursor, start=1):
-            digest = str(group["digest"])
-            apparent_size = int(group["size_bytes"] or 0)
-            path_count = int(group["path_count"])
-            physical_count = int(group["physical_copy_count"])
-            rows = list(
-                connection.execute(
-                    """
-                    SELECT f.*, r.path_display AS root_display
-                    FROM files f JOIN roots r ON r.id=f.root_id
-                    WHERE f.scan_id=? AND f.digest=? AND f.size_bytes=?
-                      AND f.status IN ('ok','reused','empty_reported')
-                    ORDER BY f.path_display
-                    """,
-                    (scan_id, digest, apparent_size),
+            CREATE TEMP TABLE report_physical_copies AS
+            SELECT
+                digest,
+                size_bytes,
+                device,
+                inode,
+                MAX(COALESCE(allocated_bytes, 0)) AS allocated_bytes,
+                MAX(
+                    CASE
+                        WHEN allocated_bytes IS NOT NULL AND allocated_bytes < size_bytes THEN 1
+                        ELSE 0
+                    END
+                ) AS sparse
+            FROM report_eligible_files
+            GROUP BY digest, size_bytes, device, inode;
+
+            CREATE INDEX temp.idx_report_physical_group
+                ON report_physical_copies(digest, size_bytes);
+            """
+        )
+    timings["candidate_materialization_seconds"] = timing["elapsed"]
+
+    with report_phase(logger, "aggregating duplicate groups") as timing:
+        connection.execute(
+            """
+            CREATE TEMP TABLE report_duplicate_groups AS
+            WITH path_stats AS (
+                SELECT
+                    digest,
+                    size_bytes,
+                    COUNT(*) AS path_count,
+                    MAX(
+                        CASE cleanup_risk
+                            WHEN 'critical' THEN 3
+                            WHEN 'high' THEN 2
+                            WHEN 'medium' THEN 1
+                            ELSE 0
+                        END
+                    ) AS risk_rank
+                FROM report_eligible_files
+                GROUP BY digest, size_bytes
+                HAVING COUNT(*) > 1
+            ),
+            physical_stats AS (
+                SELECT
+                    digest,
+                    size_bytes,
+                    COUNT(*) AS physical_copy_count,
+                    SUM(allocated_bytes) AS total_unique_allocated_bytes,
+                    MAX(allocated_bytes) AS largest_allocated_copy,
+                    MIN(allocated_bytes) AS smallest_allocated_copy,
+                    MAX(sparse) AS contains_sparse_file
+                FROM report_physical_copies
+                GROUP BY digest, size_bytes
+            ),
+            combined AS (
+                SELECT
+                    p.digest,
+                    p.size_bytes,
+                    p.path_count,
+                    s.physical_copy_count,
+                    p.size_bytes * (p.path_count - 1) AS logical_duplicate_bytes,
+                    s.total_unique_allocated_bytes,
+                    s.total_unique_allocated_bytes - s.largest_allocated_copy
+                        AS estimated_reclaimable_min_bytes,
+                    s.total_unique_allocated_bytes - s.smallest_allocated_copy
+                        AS estimated_reclaimable_max_bytes,
+                    s.contains_sparse_file,
+                    p.risk_rank
+                FROM path_stats AS p
+                JOIN physical_stats AS s
+                  ON s.digest=p.digest AND s.size_bytes=p.size_bytes
+            )
+            SELECT
+                ROW_NUMBER() OVER (
+                    ORDER BY size_bytes DESC, path_count DESC, digest
+                ) AS group_number,
+                *
+            FROM combined
+            """
+        )
+        connection.executescript(
+            """
+            CREATE UNIQUE INDEX temp.idx_report_groups_number
+                ON report_duplicate_groups(group_number);
+            CREATE UNIQUE INDEX temp.idx_report_groups_hash_size
+                ON report_duplicate_groups(digest, size_bytes);
+            """
+        )
+        row = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS groups,
+                COALESCE(SUM(CASE WHEN physical_copy_count > 1 AND size_bytes > 0 THEN 1 ELSE 0 END), 0)
+                    AS cleanup_groups,
+                COALESCE(SUM(CASE WHEN physical_copy_count = 1 THEN 1 ELSE 0 END), 0)
+                    AS hardlink_only_groups,
+                COALESCE(SUM(path_count), 0) AS duplicate_paths,
+                COALESCE(SUM(logical_duplicate_bytes), 0) AS logical_duplicate_bytes,
+                COALESCE(SUM(estimated_reclaimable_min_bytes), 0)
+                    AS estimated_reclaimable_min_bytes,
+                COALESCE(SUM(estimated_reclaimable_max_bytes), 0)
+                    AS estimated_reclaimable_max_bytes
+            FROM report_duplicate_groups
+            """
+        ).fetchone()
+        if row is not None:
+            for key in summary:
+                summary[key] = int(row[key] or 0)
+    timings["group_aggregation_seconds"] = timing["elapsed"]
+
+    total_rows = summary["duplicate_paths"]
+    with report_phase(
+        logger,
+        f"exporting duplicate paths ({summary['groups']} groups, {total_rows} rows)",
+    ) as timing:
+        with restrictive_umask(), open(
+            temp_path,
+            "w",
+            newline="",
+            encoding="utf-8",
+            errors="backslashreplace",
+        ) as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                (
+                    "duplicate_group",
+                    "group_kind",
+                    "cleanup_candidate",
+                    "algorithm",
+                    "hash",
+                    "apparent_size_bytes",
+                    "path_count",
+                    "physical_copy_count",
+                    "logical_duplicate_bytes",
+                    "total_unique_allocated_bytes",
+                    "estimated_reclaimable_min_bytes",
+                    "estimated_reclaimable_max_bytes",
+                    "contains_sparse_file",
+                    "same_physical_file_only",
+                    "group_cleanup_risk",
+                    "root",
+                    "path",
+                    "path_bytes_hex",
+                    "allocated_size_bytes",
+                    "device",
+                    "inode",
+                    "mtime_utc",
+                    "ctime_utc",
+                    "management_class",
+                    "classification_confidence",
+                    "classification_reason",
+                    "cleanup_risk",
                 )
             )
-
-            physical_allocations: dict[tuple[int | None, int | None], int] = {}
-            contains_sparse = False
-            risks: list[str] = []
+            rows = connection.execute(
+                """
+                SELECT
+                    g.*,
+                    f.root_id,
+                    f.path_display,
+                    f.path_raw,
+                    f.allocated_bytes,
+                    f.device,
+                    f.inode,
+                    f.mtime_ns,
+                    f.ctime_ns,
+                    f.management_class,
+                    f.classification_confidence,
+                    f.classification_reason,
+                    f.cleanup_risk,
+                    r.path_display AS root_display
+                FROM report_duplicate_groups AS g
+                JOIN report_eligible_files AS f
+                  ON f.digest=g.digest AND f.size_bytes=g.size_bytes
+                JOIN roots AS r ON r.id=f.root_id
+                ORDER BY g.group_number, f.path_display, f.id
+                """
+            )
+            processed = 0
+            last_processed = 0
+            last_logged = time.monotonic()
+            previous_group = 0
             for row in rows:
-                allocated = row["allocated_bytes"]
-                if allocated is not None and allocated < apparent_size:
-                    contains_sparse = True
-                identity = (row["device"], row["inode"])
-                physical_allocations[identity] = max(
-                    physical_allocations.get(identity, 0), int(allocated or 0)
-                )
-                risks.append(str(row["cleanup_risk"]))
+                group_number = int(row["group_number"])
+                apparent_size = int(row["size_bytes"] or 0)
+                physical_count = int(row["physical_copy_count"])
+                hardlink_only = physical_count == 1
+                group_kind = "hardlink_aliases" if hardlink_only else "physical_duplicates"
+                cleanup_candidate = "no" if hardlink_only or apparent_size == 0 else "review"
+                group_risk = _risk_from_rank(int(row["risk_rank"] or 0))
 
-            allocations = list(physical_allocations.values())
-            total_allocated = sum(allocations)
-            reclaimable_min = total_allocated - max(allocations, default=0)
-            reclaimable_max = total_allocated - min(allocations, default=0)
-            logical_duplicate = apparent_size * (path_count - 1)
-            hardlink_only = physical_count == 1
-            group_kind = "hardlink_aliases" if hardlink_only else "physical_duplicates"
-            cleanup_candidate = "no" if hardlink_only or apparent_size == 0 else "review"
-            group_risk = risk_max(risks)
-
-            summary["groups"] += 1
-            summary["duplicate_paths"] += path_count
-            summary["logical_duplicate_bytes"] += logical_duplicate
-            if hardlink_only:
-                summary["hardlink_only_groups"] += 1
-            if not hardlink_only:
-                if apparent_size > 0:
-                    summary["cleanup_groups"] += 1
-                summary["estimated_reclaimable_min_bytes"] += reclaimable_min
-                summary["estimated_reclaimable_max_bytes"] += reclaimable_max
-
-            if log_detail in ("verbose", "trace"):
-                logger.info(
-                    "Duplicate group %d | kind=%s | size=%s | paths=%d | physical copies=%d | estimated reclaimable=%s..%s | risk=%s | hash=%s",
-                    group_number,
-                    group_kind,
-                    human_bytes(apparent_size),
-                    path_count,
-                    physical_count,
-                    human_bytes(reclaimable_min),
-                    human_bytes(reclaimable_max),
-                    group_risk,
-                    digest,
-                )
-
-            for row in rows:
+                if group_number != previous_group and log_detail in ("verbose", "trace"):
+                    logger.info(
+                        "Duplicate group %d | kind=%s | size=%s | paths=%d | physical copies=%d | estimated reclaimable=%s..%s | risk=%s | hash=%s",
+                        group_number,
+                        group_kind,
+                        human_bytes(apparent_size),
+                        int(row["path_count"]),
+                        physical_count,
+                        human_bytes(int(row["estimated_reclaimable_min_bytes"] or 0)),
+                        human_bytes(int(row["estimated_reclaimable_max_bytes"] or 0)),
+                        group_risk,
+                        row["digest"],
+                    )
+                previous_group = group_number
                 if log_detail == "trace":
                     logger.info("  %s", row["path_display"])
+
                 writer.writerow(
                     (
                         group_number,
                         group_kind,
                         cleanup_candidate,
                         algorithm,
-                        digest,
+                        row["digest"],
                         apparent_size,
-                        path_count,
+                        int(row["path_count"]),
                         physical_count,
-                        logical_duplicate,
-                        total_allocated,
-                        reclaimable_min,
-                        reclaimable_max,
-                        "yes" if contains_sparse else "no",
+                        int(row["logical_duplicate_bytes"] or 0),
+                        int(row["total_unique_allocated_bytes"] or 0),
+                        int(row["estimated_reclaimable_min_bytes"] or 0),
+                        int(row["estimated_reclaimable_max_bytes"] or 0),
+                        "yes" if int(row["contains_sparse_file"] or 0) else "no",
                         "yes" if hardlink_only else "no",
                         group_risk,
                         row["root_display"],
@@ -1844,20 +2053,49 @@ def generate_duplicate_csv(
                         row["cleanup_risk"],
                     )
                 )
-        fsync_file(handle)
-    os.chmod(temp_path, 0o600)
-    return summary
+                processed += 1
+                now = time.monotonic()
+                if progress_due(processed, last_processed, now, last_logged):
+                    logger.info(
+                        "Report progress: duplicate paths | %d / %d rows",
+                        processed,
+                        total_rows,
+                    )
+                    last_processed = processed
+                    last_logged = now
+            fsync_file(handle)
+        os.chmod(temp_path, 0o600)
+    timings["duplicate_export_seconds"] = timing["elapsed"]
+    _drop_report_temp_tables(connection)
+    return summary, timings
 
 
 def finalize_database(connection: sqlite3.Connection, scan_id: str) -> None:
-    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     connection.execute(
-        "UPDATE scans SET state='completed', ended_utc=? WHERE scan_id=?",
-        (utc_now(), scan_id),
+        """
+        UPDATE scans
+        SET state='completed', ended_utc=?, program_version=?, schema_version=?,
+            interrupted_reason=''
+        WHERE scan_id=?
+        """,
+        (utc_now(), VERSION, SCHEMA_VERSION, scan_id),
     )
     connection.commit()
-    connection.execute("PRAGMA wal_checkpoint(FULL)")
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.execute("PRAGMA journal_mode=DELETE")
+    connection.commit()
+
+
+def remove_sqlite_sidecars(database_path: Path) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        try:
+            Path(str(database_path) + suffix).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def set_scan_state(
@@ -1906,6 +2144,7 @@ def restore_signal_handlers(previous: dict[int, object]) -> None:
         signal.signal(signum, handler)
 
 
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
@@ -1919,10 +2158,36 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--retry-changed cannot be negative")
     if args.resume and args.incremental:
         raise ValueError("--resume and --incremental cannot be used together")
+    if args.report_only and (args.resume or args.incremental):
+        raise ValueError("--report-only cannot be combined with --resume or --incremental")
     if args.ignore_empty:
         args.empty_files = "ignore"
     if args.no_print_duplicates and args.log_detail != "summary":
         args.log_detail = "summary"
+
+
+def select_report_scan(connection: sqlite3.Connection, algorithm: str) -> sqlite3.Row:
+    row = connection.execute(
+        """
+        SELECT * FROM scans
+        WHERE algorithm=?
+        ORDER BY started_utc DESC
+        LIMIT 1
+        """,
+        (algorithm,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"No scan using algorithm {algorithm!r} exists in the selected database."
+        )
+    count_row = connection.execute(
+        "SELECT COUNT(*) AS count FROM files WHERE scan_id=?",
+        (row["scan_id"],),
+    ).fetchone()
+    if count_row is None or int(count_row["count"] or 0) == 0:
+        raise ValueError("The selected scan contains no file records to report.")
+    return row
+
 
 
 def run_scan(args: argparse.Namespace) -> int:
@@ -1940,7 +2205,12 @@ def run_scan(args: argparse.Namespace) -> int:
     duplicate_csv_partial = output_dir / "duplicate_files.csv.partial"
 
     logger = configure_logging(log_path, args.log_detail)
-    excludes = [normalize_existing_directory(path) if os.path.isdir(os.path.expanduser(path)) else os.path.realpath(os.path.abspath(os.path.expanduser(path))) for path in args.exclude]
+    excludes = [
+        normalize_existing_directory(path)
+        if os.path.isdir(os.path.expanduser(path))
+        else os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+        for path in args.exclude
+    ]
     for automatic in automatic_excludes(roots):
         normalized = os.path.realpath(automatic)
         if normalized not in excludes:
@@ -1953,13 +2223,21 @@ def run_scan(args: argparse.Namespace) -> int:
     config = configuration_payload(args, roots, excludes)
     config_fingerprint = fingerprint(config)
 
-    if args.resume:
+    if args.report_only:
+        if not partial_db.exists():
+            if not final_db.exists():
+                raise ValueError(
+                    f"No database exists at {partial_db} or {final_db}."
+                )
+            sqlite_backup(final_db, partial_db)
+    elif args.resume:
         if not partial_db.exists():
             raise ValueError(f"No partial database exists at {partial_db}")
     else:
         if partial_db.exists():
             raise ValueError(
-                f"An unfinished scan exists at {partial_db}. Use --resume or move/delete that file."
+                f"An unfinished scan exists at {partial_db}. Use --resume, "
+                "--report-only, or move/delete that file."
             )
         if args.incremental and final_db.exists():
             sqlite_backup(final_db, partial_db)
@@ -1970,7 +2248,7 @@ def run_scan(args: argparse.Namespace) -> int:
     try:
         connection = open_database(partial_db)
     except Exception:
-        if not args.resume:
+        if not args.resume and not args.report_only:
             for candidate in (
                 partial_db,
                 Path(str(partial_db) + "-wal"),
@@ -1978,154 +2256,211 @@ def run_scan(args: argparse.Namespace) -> int:
             ):
                 try:
                     candidate.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError:
+                except (FileNotFoundError, OSError):
                     pass
         raise
+
     scan_id = ""
     cancel_event = threading.Event()
+    progress_stop_event = threading.Event()
     previous_handlers = install_signal_handlers(cancel_event)
     counters = Counters()
     counters_lock = threading.Lock()
     tracker = ProgressTracker()
     reporter: ProgressReporter | None = None
-    scan_started = time.monotonic()
+    total_started = time.monotonic()
+    hashing_started: float | None = None
+    hashing_elapsed = 0.0
+    logical_read = 0
     previous_scan_id: str | None = None
 
     try:
-        if args.resume:
-            scan_id, generation, root_infos = resume_scan(connection, config_fingerprint)
-            existing_records = count_existing_resume_rows(connection, scan_id)
-            logger.info("Resuming scan %s with %d reusable existing records", scan_id, existing_records)
-        else:
-            if args.incremental:
-                previous_scan_id = latest_completed_scan_id(connection, args.algorithm)
-            scan_id, generation, root_infos = initialize_new_scan(
-                connection, args, roots, config_fingerprint
+        if args.report_only:
+            scan_row = select_report_scan(connection, args.algorithm)
+            scan_id = str(scan_row["scan_id"])
+            connection.execute(
+                "UPDATE scans SET state='reporting', ended_utc=NULL, interrupted_reason='' WHERE scan_id=?",
+                (scan_id,),
             )
-
-        logger.info("Starting %s %s | scan_id=%s", PROGRAM_NAME, VERSION, scan_id)
-        logger.info("Roots: %s", ", ".join(info.path_display for info in root_infos))
-        logger.info(
-            "Algorithm=%s | workers=%d | empty_files=%s | cache_policy=%s",
-            args.algorithm,
-            args.workers,
-            args.empty_files,
-            args.cache_policy,
-        )
-        logger.info("Output directory: %s", safe_display(str(output_dir)))
-        if excludes:
-            logger.info("Excluded paths: %s", ", ".join(safe_display(item) for item in excludes))
-        for root in root_infos:
+            connection.commit()
             logger.info(
-                "Filesystem: root=%s | type=%s | source=%s | mount=%s | uuid=%s",
-                root.path_display,
-                root.filesystem_type,
-                root.mount_source,
-                root.mount_point,
-                root.filesystem_uuid or "unknown",
+                "Starting %s %s in report-only mode | scan_id=%s | source state=%s",
+                PROGRAM_NAME,
+                VERSION,
+                scan_id,
+                scan_row["state"],
             )
-        for parent in root_infos:
-            children = nested_root_excludes(root_infos).get(parent.root_id, ())
-            if children:
+            logger.info("No filesystem walk or hashing will be performed.")
+        else:
+            if args.resume:
+                scan_id, generation, root_infos = resume_scan(connection, config_fingerprint)
+                existing_records = count_existing_resume_rows(connection, scan_id)
                 logger.info(
-                    "Overlapping-root protection: %s will skip child roots: %s",
-                    parent.path_display,
-                    ", ".join(safe_display(child) for child in children),
+                    "Resuming scan %s with %d reusable existing records",
+                    scan_id,
+                    existing_records,
+                )
+            else:
+                if args.incremental:
+                    previous_scan_id = latest_completed_scan_id(connection, args.algorithm)
+                scan_id, generation, root_infos = initialize_new_scan(
+                    connection, args, roots, config_fingerprint
                 )
 
-        hasher_factory = make_hasher(args.algorithm)
-        chunk_size = args.chunk_size_mib * 1024 * 1024
-        reporter = ProgressReporter(
-            tracker=tracker,
-            counters=counters,
-            counters_lock=counters_lock,
-            logger=logger,
-            stop_event=cancel_event,
-            progress_seconds=args.progress_seconds,
-            file_progress_seconds=args.file_progress_seconds,
-            detail=args.log_detail,
-        )
-        reporter.start()
-
-        tasks = walk_files(
-            roots=root_infos,
-            excludes=excludes,
-            one_file_system=args.one_file_system,
-            generation=generation,
-            logger=logger,
-            cancel_event=cancel_event,
-        )
-
-        last_commit = time.monotonic()
-        max_pending = (
-            1 if args.workers == 1
-            else max(args.workers * DEFAULT_QUEUE_MULTIPLIER, args.workers)
-        )
-        pending: set[Future[HashResult]] = set()
-
-        with ThreadPoolExecutor(
-            max_workers=args.workers,
-            thread_name_prefix="hashwatchdog-worker",
-        ) as executor:
-            for task in tasks:
-                if cancel_event.is_set():
-                    break
-                with counters_lock:
-                    counters.discovered += 1
-
-                existing = resumable_row(connection, scan_id, task) if args.resume else None
-                if existing is not None:
-                    mark_seen(connection, int(existing["id"]), generation)
-                    with counters_lock:
-                        counters.examined += 1
-                        counters.reused += 1
-                    continue
-
-                same_inode = current_identity_row(connection, scan_id, task)
-                if same_inode is not None:
-                    copy_reused_row(
-                        connection, scan_id, task, same_inode, generation,
-                        not args.no_managed_classification,
-                    )
-                    with counters_lock:
-                        counters.examined += 1
-                        counters.reused += 1
-                    continue
-
-                reused = incremental_row(
-                    connection,
-                    previous_scan_id,
-                    task,
-                    args.algorithm,
-                    args.cache_policy,
+            logger.info("Starting %s %s | scan_id=%s", PROGRAM_NAME, VERSION, scan_id)
+            logger.info("Roots: %s", ", ".join(info.path_display for info in root_infos))
+            logger.info(
+                "Algorithm=%s | workers=%d | empty_files=%s | cache_policy=%s",
+                args.algorithm,
+                args.workers,
+                args.empty_files,
+                args.cache_policy,
+            )
+            logger.info("Output directory: %s", safe_display(str(output_dir)))
+            if excludes:
+                logger.info(
+                    "Excluded paths: %s",
+                    ", ".join(safe_display(item) for item in excludes),
                 )
-                if reused is not None:
-                    copy_reused_row(
-                        connection, scan_id, task, reused, generation,
-                        not args.no_managed_classification,
+            for root in root_infos:
+                logger.info(
+                    "Filesystem: root=%s | type=%s | source=%s | mount=%s | uuid=%s",
+                    root.path_display,
+                    root.filesystem_type,
+                    root.mount_source,
+                    root.mount_point,
+                    root.filesystem_uuid or "unknown",
+                )
+            nested = nested_root_excludes(root_infos)
+            for parent in root_infos:
+                children = nested.get(parent.root_id, ())
+                if children:
+                    logger.info(
+                        "Overlapping-root protection: %s will skip child roots: %s",
+                        parent.path_display,
+                        ", ".join(safe_display(child) for child in children),
                     )
-                    with counters_lock:
-                        counters.examined += 1
-                        counters.reused += 1
-                    continue
 
-                pending.add(
-                    executor.submit(
-                        hash_one_file,
+            hasher_factory = make_hasher(args.algorithm)
+            chunk_size = args.chunk_size_mib * 1024 * 1024
+            reporter = ProgressReporter(
+                tracker=tracker,
+                counters=counters,
+                counters_lock=counters_lock,
+                logger=logger,
+                stop_event=progress_stop_event,
+                progress_seconds=args.progress_seconds,
+                file_progress_seconds=args.file_progress_seconds,
+                detail=args.log_detail,
+            )
+            hashing_started = time.monotonic()
+            reporter.start()
+
+            tasks = walk_files(
+                roots=root_infos,
+                excludes=excludes,
+                one_file_system=args.one_file_system,
+                generation=generation,
+                logger=logger,
+                cancel_event=cancel_event,
+            )
+            last_commit = time.monotonic()
+            max_pending = (
+                1
+                if args.workers == 1
+                else max(args.workers * DEFAULT_QUEUE_MULTIPLIER, args.workers)
+            )
+            pending: set[Future[HashResult]] = set()
+
+            with ThreadPoolExecutor(
+                max_workers=args.workers,
+                thread_name_prefix="hashwatchdog-worker",
+            ) as executor:
+                for task in tasks:
+                    if cancel_event.is_set():
+                        break
+                    with counters_lock:
+                        counters.discovered += 1
+
+                    existing = resumable_row(connection, scan_id, task) if args.resume else None
+                    if existing is not None:
+                        mark_seen(connection, int(existing["id"]), generation)
+                        with counters_lock:
+                            counters.examined += 1
+                            counters.reused += 1
+                        continue
+
+                    same_inode = current_identity_row(connection, scan_id, task)
+                    if same_inode is not None:
+                        copy_reused_row(
+                            connection,
+                            scan_id,
+                            task,
+                            same_inode,
+                            generation,
+                            not args.no_managed_classification,
+                        )
+                        with counters_lock:
+                            counters.examined += 1
+                            counters.reused += 1
+                        continue
+
+                    reused = incremental_row(
+                        connection,
+                        previous_scan_id,
                         task,
-                        hasher_factory,
-                        chunk_size,
-                        args.retry_changed,
-                        args.empty_files,
-                        tracker,
-                        cancel_event,
-                        not args.no_managed_classification,
+                        args.algorithm,
+                        args.cache_policy,
                     )
-                )
+                    if reused is not None:
+                        copy_reused_row(
+                            connection,
+                            scan_id,
+                            task,
+                            reused,
+                            generation,
+                            not args.no_managed_classification,
+                        )
+                        with counters_lock:
+                            counters.examined += 1
+                            counters.reused += 1
+                        continue
 
-                if len(pending) >= max_pending:
+                    pending.add(
+                        executor.submit(
+                            hash_one_file,
+                            task,
+                            hasher_factory,
+                            chunk_size,
+                            args.retry_changed,
+                            args.empty_files,
+                            tracker,
+                            cancel_event,
+                            not args.no_managed_classification,
+                        )
+                    )
+                    if len(pending) >= max_pending:
+                        completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        process_results(
+                            completed,
+                            connection,
+                            scan_id,
+                            args.algorithm,
+                            counters,
+                            counters_lock,
+                            logger,
+                            args.print_hashes,
+                        )
+
+                    now = time.monotonic()
+                    if now - last_commit >= COMMIT_SECONDS:
+                        connection.commit()
+                        last_commit = now
+
+                if cancel_event.is_set():
+                    for future in pending:
+                        future.cancel()
+                while pending:
                     completed, pending = wait(pending, return_when=FIRST_COMPLETED)
                     process_results(
                         completed,
@@ -2138,41 +2473,40 @@ def run_scan(args: argparse.Namespace) -> int:
                         args.print_hashes,
                     )
 
-                now = time.monotonic()
-                if now - last_commit >= COMMIT_SECONDS:
-                    connection.commit()
-                    last_commit = now
-
             if cancel_event.is_set():
-                for future in pending:
-                    future.cancel()
-            while pending:
-                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
-                process_results(
-                    completed,
-                    connection,
-                    scan_id,
-                    args.algorithm,
-                    counters,
-                    counters_lock,
-                    logger,
-                    args.print_hashes,
-                )
+                raise ScanInterrupted("scan cancellation requested")
 
-        if cancel_event.is_set():
-            raise ScanInterrupted("scan cancellation requested")
+            connection.execute(
+                "DELETE FROM files WHERE scan_id=? AND seen_generation<>?",
+                (scan_id, generation),
+            )
+            connection.execute(
+                "UPDATE scans SET state='hashing_complete', interrupted_reason='' WHERE scan_id=?",
+                (scan_id,),
+            )
+            connection.commit()
 
-        # Remove stale rows from a prior resume generation. Paths not encountered in
-        # the current walk were deleted, moved, or newly excluded.
-        connection.execute(
-            "DELETE FROM files WHERE scan_id=? AND seen_generation<>?",
-            (scan_id, generation),
+            progress_stop_event.set()
+            reporter.join(timeout=5.0)
+            reporter = None
+            hashing_elapsed = max(time.monotonic() - hashing_started, 0.001)
+            logical_read, _tracker_elapsed, _active = tracker.snapshot()
+            logger.info(
+                "Hashing complete: %s read in %.1f seconds (average %s/s)",
+                human_bytes(logical_read),
+                hashing_elapsed,
+                human_bytes(logical_read / hashing_elapsed),
+            )
+
+        report_started = time.monotonic()
+        prepare_seconds = prepare_reporting_database(connection, logger)
+        all_rows, all_export_seconds = generate_all_hashes_csv(
+            connection,
+            scan_id,
+            all_csv_partial,
+            logger,
         )
-        connection.commit()
-
-        logger.info("Hashing complete; generating atomic reports")
-        generate_all_hashes_csv(connection, scan_id, all_csv_partial)
-        duplicate_summary = generate_duplicate_csv(
+        duplicate_summary, duplicate_timings = generate_duplicate_csv(
             connection=connection,
             scan_id=scan_id,
             algorithm=args.algorithm,
@@ -2181,45 +2515,61 @@ def run_scan(args: argparse.Namespace) -> int:
             logger=logger,
             log_detail=args.log_detail,
         )
+        reporting_elapsed = max(time.monotonic() - report_started, 0.001)
+
         finalize_database(connection, scan_id)
         connection.close()
         connection = None  # type: ignore[assignment]
 
-        # The SQLite database is canonical. Promote it first; if a later CSV
-        # promotion is interrupted, reports can be regenerated from the complete DB.
         atomic_replace(partial_db, final_db)
+        remove_sqlite_sidecars(partial_db)
+        remove_sqlite_sidecars(final_db)
         atomic_replace(all_csv_partial, all_csv)
         atomic_replace(duplicate_csv_partial, duplicate_csv)
 
-        elapsed = max(time.monotonic() - scan_started, 0.001)
-        logical_read, _tracker_elapsed, _active = tracker.snapshot()
-        with counters_lock:
-            final_counts = Counters(
-                discovered=counters.discovered,
-                examined=counters.examined,
-                hashed=counters.hashed,
-                reused=counters.reused,
-                errors=counters.errors,
-                changed=counters.changed,
-                cancelled=counters.cancelled,
-                empty=counters.empty,
+        total_elapsed = max(time.monotonic() - total_started, 0.001)
+        if not args.report_only:
+            with counters_lock:
+                final_counts = Counters(
+                    discovered=counters.discovered,
+                    examined=counters.examined,
+                    hashed=counters.hashed,
+                    reused=counters.reused,
+                    errors=counters.errors,
+                    changed=counters.changed,
+                    cancelled=counters.cancelled,
+                    empty=counters.empty,
+                )
+            logger.info(
+                "Finished: %d discovered | %d examined | %d newly hashed | %d reused | %d errors | %d changed | %d empty",
+                final_counts.discovered,
+                final_counts.examined,
+                final_counts.hashed,
+                final_counts.reused,
+                final_counts.errors,
+                final_counts.changed,
+                final_counts.empty,
             )
+            logger.info(
+                "Hashing phase: %s in %.1f seconds | average %s/s",
+                human_bytes(logical_read),
+                hashing_elapsed,
+                human_bytes(logical_read / max(hashing_elapsed, 0.001)),
+            )
+        else:
+            logger.info("Hashing phase: skipped (report-only mode)")
+
         logger.info(
-            "Finished: %d discovered | %d examined | %d newly hashed | %d reused | %d errors | %d changed | %d empty",
-            final_counts.discovered,
-            final_counts.examined,
-            final_counts.hashed,
-            final_counts.reused,
-            final_counts.errors,
-            final_counts.changed,
-            final_counts.empty,
+            "Reporting phase: %.1f seconds | prepare %.2fs | all-file export %.2fs | candidate materialization %.2fs | group aggregation %.2fs | duplicate export %.2fs",
+            reporting_elapsed,
+            prepare_seconds,
+            all_export_seconds,
+            duplicate_timings["candidate_materialization_seconds"],
+            duplicate_timings["group_aggregation_seconds"],
+            duplicate_timings["duplicate_export_seconds"],
         )
-        logger.info(
-            "Processed %s logical bytes in %.1f seconds (average %s/s)",
-            human_bytes(logical_read),
-            elapsed,
-            human_bytes(logical_read / elapsed),
-        )
+        logger.info("Total runtime: %.1f seconds", total_elapsed)
+        logger.info("All-file rows exported: %d", all_rows)
         logger.info(
             "Duplicate groups=%d | cleanup review groups=%d | hard-link-only groups=%d | duplicate paths=%d",
             duplicate_summary["groups"],
@@ -2241,26 +2591,31 @@ def run_scan(args: argparse.Namespace) -> int:
 
     except (KeyboardInterrupt, ScanInterrupted) as exc:
         cancel_event.set()
+        progress_stop_event.set()
         reason = "interrupted by user" if isinstance(exc, KeyboardInterrupt) else str(exc)
         if scan_id and connection is not None:
             set_scan_state(connection, scan_id, "interrupted", reason)
+        mode = "--report-only" if args.report_only else "--resume"
         logger.warning(
-            "Scan interrupted. Resumable state remains at %s. Re-run with --resume and the same options.",
+            "Operation interrupted. Canonical partial database remains at %s. Re-run with %s.",
             safe_display(str(partial_db)),
+            mode,
         )
         return 130
     except (sqlite3.Error, OSError) as exc:
         cancel_event.set()
+        progress_stop_event.set()
         state = "failed"
         if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
             state = "disk_full"
         if scan_id and connection is not None:
             set_scan_state(connection, scan_id, state, f"{type(exc).__name__}: {exc}")
-        logger.error("Scan failed: %s: %s", type(exc).__name__, safe_display(str(exc)))
+        logger.error("Operation failed: %s: %s", type(exc).__name__, safe_display(str(exc)))
         logger.error("Partial database retained at %s", safe_display(str(partial_db)))
         return 1
     finally:
         cancel_event.set()
+        progress_stop_event.set()
         if reporter is not None:
             reporter.join(timeout=2.0)
         if connection is not None:
