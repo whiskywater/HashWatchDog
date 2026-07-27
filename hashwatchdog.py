@@ -1,68 +1,263 @@
 #!/usr/bin/env python3
-"""Cross-volume duplicate file scanner for Linux and Windows filesystems.
+"""HashWatchDog: cross-filesystem duplicate-file scanner.
 
-Run this from installed Linux or a Linux live environment. Windows filesystems
-must first be mounted by Linux (preferably read-only). Multiple --root options
-are scanned together, so duplicates can be found across different partitions,
-drives, and filesystems.
+HashWatchDog runs on Linux (including live Linux environments) and scans one or
+more mounted directory trees as a single global namespace. Windows filesystems
+must be mounted by Linux first.
 
-Outputs:
-  - all_file_hashes.csv: one row for every regular file examined
-  - duplicate_files.csv: duplicate groups and every matching path
-  - scan.log: progress, warnings, and errors
-  - hash_index.sqlite3: searchable local index used to keep memory usage bounded
+The SQLite database is the canonical scan record. CSV reports are generated only
+when a scan completes successfully, then atomically moved into place.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import errno
 import hashlib
+import json
 import logging
 import os
+import platform
+import shutil
+import signal
+import socket
 import sqlite3
+import stat
 import sys
+import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
-PROGRAM_NAME = "duplicate-hash-scanner"
-VERSION = "1.0.0"
+PROGRAM_NAME = "hashwatchdog"
+VERSION = "2.0.0"
+SCHEMA_VERSION = 2
 DEFAULT_CHUNK_MIB = 8
 DEFAULT_PROGRESS_SECONDS = 5.0
+DEFAULT_FILE_PROGRESS_SECONDS = 10.0
 DEFAULT_QUEUE_MULTIPLIER = 4
+COMMIT_SECONDS = 2.0
+RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
-@dataclass(slots=True)
-class FileTask:
-    root: str
+class ScanInterrupted(RuntimeError):
+    """Raised when SIGTERM requests a cooperative stop."""
+
+
+@dataclass(slots=True, frozen=True)
+class RootInfo:
+    root_id: int
     path: str
+    path_display: str
+    path_raw: bytes
+    device: int
+    mount_point: str
+    filesystem_type: str
+    mount_source: str
+    filesystem_uuid: str
+
+
+@dataclass(slots=True, frozen=True)
+class FileTask:
+    root: RootInfo
+    path: str
+    path_display: str
+    path_raw: bytes
+    size_bytes: int
+    allocated_bytes: int | None
+    mtime_ns: int
+    ctime_ns: int
+    device: int
+    inode: int
+    nlink: int
+    generation: int
 
 
 @dataclass(slots=True)
 class HashResult:
-    root: str
-    path: str
-    size_bytes: int | None
-    mtime_ns: int | None
-    device: int | None
-    inode: int | None
+    task: FileTask
     digest: str
+    sample_digest: str
     status: str
     error: str
     bytes_read: int
     elapsed_seconds: float
+    final_size_bytes: int | None
+    final_allocated_bytes: int | None
+    final_mtime_ns: int | None
+    final_ctime_ns: int | None
+    final_device: int | None
+    final_inode: int | None
+    management_class: str
+    classification_confidence: str
+    classification_reason: str
+    cleanup_risk: str
+
+
+@dataclass(slots=True)
+class ActiveFile:
+    path_display: str
+    size_bytes: int
+    bytes_read: int
+    started: float
+    attempt: int
+
+
+@dataclass(slots=True)
+class Counters:
+    discovered: int = 0
+    examined: int = 0
+    hashed: int = 0
+    reused: int = 0
+    errors: int = 0
+    changed: int = 0
+    cancelled: int = 0
+    empty: int = 0
+
+
+class ProgressTracker:
+    """Thread-safe aggregate and active-file progress state."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: dict[int, ActiveFile] = {}
+        self._logical_bytes_read = 0
+        self._started = time.monotonic()
+
+    def start_file(self, path_display: str, size_bytes: int, attempt: int) -> int:
+        key = threading.get_ident()
+        with self._lock:
+            self._active[key] = ActiveFile(
+                path_display=path_display,
+                size_bytes=size_bytes,
+                bytes_read=0,
+                started=time.monotonic(),
+                attempt=attempt,
+            )
+        return key
+
+    def add_bytes(self, key: int, count: int) -> None:
+        with self._lock:
+            self._logical_bytes_read += count
+            active = self._active.get(key)
+            if active is not None:
+                active.bytes_read += count
+
+    def finish_file(self, key: int) -> None:
+        with self._lock:
+            self._active.pop(key, None)
+
+    def snapshot(self) -> tuple[int, float, list[ActiveFile]]:
+        with self._lock:
+            return (
+                self._logical_bytes_read,
+                max(time.monotonic() - self._started, 0.001),
+                [
+                    ActiveFile(
+                        path_display=item.path_display,
+                        size_bytes=item.size_bytes,
+                        bytes_read=item.bytes_read,
+                        started=item.started,
+                        attempt=item.attempt,
+                    )
+                    for item in self._active.values()
+                ],
+            )
+
+
+class ProgressReporter(threading.Thread):
+    def __init__(
+        self,
+        tracker: ProgressTracker,
+        counters: Counters,
+        counters_lock: threading.Lock,
+        logger: logging.Logger,
+        stop_event: threading.Event,
+        progress_seconds: float,
+        file_progress_seconds: float,
+        detail: str,
+    ) -> None:
+        super().__init__(name="progress-reporter", daemon=True)
+        self.tracker = tracker
+        self.counters = counters
+        self.counters_lock = counters_lock
+        self.logger = logger
+        self.stop_event = stop_event
+        self.progress_seconds = progress_seconds
+        self.file_progress_seconds = file_progress_seconds
+        self.detail = detail
+
+    def run(self) -> None:
+        next_general = time.monotonic() + self.progress_seconds
+        next_file = time.monotonic() + self.file_progress_seconds
+        while not self.stop_event.wait(0.25):
+            now = time.monotonic()
+            if now >= next_general:
+                logical_read, elapsed, active = self.tracker.snapshot()
+                with self.counters_lock:
+                    examined = self.counters.examined
+                    discovered = self.counters.discovered
+                    reused = self.counters.reused
+                self.logger.info(
+                    "Progress: %d files completed | %d discovered | %d reused | %s hashed | %s/s | %d active",
+                    examined,
+                    discovered,
+                    reused,
+                    human_bytes(logical_read),
+                    human_bytes(logical_read / elapsed),
+                    len(active),
+                )
+                next_general = now + self.progress_seconds
+
+            if self.file_progress_seconds > 0 and now >= next_file:
+                logical_read, _elapsed, active = self.tracker.snapshot()
+                if active:
+                    active.sort(key=lambda item: item.bytes_read, reverse=True)
+                    limit = len(active) if self.detail == "trace" else 1
+                    for item in active[:limit]:
+                        file_elapsed = max(now - item.started, 0.001)
+                        percent = (
+                            (item.bytes_read / item.size_bytes) * 100.0
+                            if item.size_bytes > 0
+                            else 100.0
+                        )
+                        self.logger.info(
+                            "Current file: %s | file progress: %s / %s (%.1f%%) | total hashed: %s | current-file rate: %s/s | attempt %d",
+                            item.path_display,
+                            human_bytes(item.bytes_read),
+                            human_bytes(item.size_bytes),
+                            percent,
+                            human_bytes(logical_read),
+                            human_bytes(item.bytes_read / file_elapsed),
+                            item.attempt,
+                        )
+                next_file = now + self.file_progress_seconds
+
+
+_THREAD_LOCAL = threading.local()
+
+
+def worker_buffer(size: int) -> bytearray:
+    buffer = getattr(_THREAD_LOCAL, "buffer", None)
+    if buffer is None or len(buffer) != size:
+        buffer = bytearray(size)
+        _THREAD_LOCAL.buffer = buffer
+    return buffer
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog=PROGRAM_NAME,
         description=(
-            "Hash regular files under one or more mounted roots and find "
-            "duplicates across all roots."
-        )
+            "Hash regular files beneath one or more mounted roots and identify "
+            "duplicates globally across all roots."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -70,142 +265,229 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         metavar="PATH",
-        help=(
-            "Root directory to scan. Repeat this option to compare multiple "
-            "filesystems or partitions in one run."
-        ),
+        help="Root directory to scan. Repeat to compare multiple filesystems.",
     )
     parser.add_argument(
         "--output-dir",
-        default="hash-scan-output",
+        default="hashwatchdog-results",
         metavar="DIR",
-        help="Directory for CSV, log, and SQLite output (default: %(default)s).",
+        help="Directory for reports, log, and SQLite database (default: %(default)s).",
     )
     parser.add_argument(
         "--algorithm",
         choices=("sha256", "blake2b", "blake3"),
         default="sha256",
-        help=(
-            "Hash algorithm. blake3 requires the optional 'blake3' package "
-            "(default: %(default)s)."
-        ),
+        help="Hash algorithm. BLAKE3 requires the optional blake3 package.",
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=1,
         metavar="N",
-        help=(
-            "Concurrent hashing workers. Use 1 for HDDs; 2-4 may help SSD/NVMe "
-            "or separate physical drives (default: %(default)s)."
-        ),
+        help="Concurrent hash workers (default: %(default)s).",
     )
     parser.add_argument(
         "--chunk-size-mib",
         type=int,
         default=DEFAULT_CHUNK_MIB,
         metavar="MIB",
-        help="Read buffer size in MiB (default: %(default)s).",
+        help="Reusable per-worker read buffer size (default: %(default)s MiB).",
     )
     parser.add_argument(
         "--exclude",
         action="append",
         default=[],
         metavar="PATH",
-        help="Absolute path to exclude. Repeat for additional paths.",
+        help="Path to exclude. Repeat for additional paths.",
     )
     parser.add_argument(
         "--one-file-system",
         action="store_true",
-        help=(
-            "Do not cross into another mounted filesystem while walking a root. "
-            "Without this flag, mounted volumes beneath a root are included."
-        ),
+        help="Do not cross mount boundaries beneath each selected root.",
     )
     parser.add_argument(
-        "--ignore-empty",
-        action="store_true",
-        help="Do not hash or report zero-byte files.",
+        "--empty-files",
+        choices=("ignore", "count", "report"),
+        default="count",
+        help=(
+            "Empty-file policy: ignore/count exclude them from duplicate groups; "
+            "report includes them (default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--progress-seconds",
         type=float,
         default=DEFAULT_PROGRESS_SECONDS,
         metavar="SECONDS",
-        help="Terminal progress interval (default: %(default)s).",
+        help="General progress interval (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--file-progress-seconds",
+        type=float,
+        default=DEFAULT_FILE_PROGRESS_SECONDS,
+        metavar="SECONDS",
+        help="Active-file progress interval; 0 disables it (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-detail",
+        choices=("summary", "verbose", "trace"),
+        default="summary",
+        help=(
+            "summary logs operations and final totals; verbose adds duplicate-group "
+            "summaries; trace also logs every duplicate path (default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--print-hashes",
         action="store_true",
-        help=(
-            "Print every successful file hash to the terminal and scan.log. "
-            "This can noticeably slow scans containing many small files."
-        ),
+        help="Print each successful hash. This can slow scans with many small files.",
     )
-    parser.add_argument(
-        "--no-print-duplicates",
-        dest="print_duplicates",
-        action="store_false",
-        help=(
-            "Do not print every duplicate group and path to the terminal. "
-            "The complete duplicate CSV is still produced."
-        ),
-    )
-    parser.set_defaults(print_duplicates=True)
     parser.add_argument(
         "--retry-changed",
         type=int,
         default=1,
         metavar="N",
+        help="Retries when a file changes while hashing (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a compatible interrupted scan from hash_index.sqlite3.partial.",
+    )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
         help=(
-            "Retries when a file changes during hashing (default: %(default)s)."
+            "Reuse hashes from the latest completed database when path and strong "
+            "filesystem metadata are unchanged."
         ),
+    )
+    parser.add_argument(
+        "--cache-policy",
+        choices=("metadata", "sampled", "strict"),
+        default="sampled",
+        help=(
+            "Incremental reuse policy. strict rehashes all files; sampled verifies "
+            "three small regions; metadata trusts identity metadata (default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--no-managed-classification",
+        action="store_true",
+        help="Disable managed-path and cleanup-risk classification heuristics.",
+    )
+    parser.add_argument(
+        "--ignore-empty",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-print-duplicates",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
 
-def configure_logging(log_path: Path) -> logging.Logger:
-    logger = logging.getLogger(PROGRAM_NAME)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-
-    file_handler = logging.FileHandler(
-        log_path, mode="w", encoding="utf-8", errors="backslashreplace"
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    return logger
+def safe_display(value: str) -> str:
+    """Return UTF-8/terminal-safe text while preserving exact bytes elsewhere."""
+    encoded = value.encode("utf-8", "backslashreplace").decode("utf-8")
+    pieces: list[str] = []
+    for char in encoded:
+        code = ord(char)
+        if char == "\n":
+            pieces.append("\\n")
+        elif char == "\r":
+            pieces.append("\\r")
+        elif char == "\t":
+            pieces.append("\\t")
+        elif code < 32 or code == 127:
+            pieces.append(f"\\x{code:02x}")
+        else:
+            pieces.append(char)
+    return "".join(pieces)
 
 
-def normalize_existing_directory(raw_path: str) -> str:
-    path = os.path.abspath(os.path.expanduser(raw_path))
-    if not os.path.exists(path):
-        raise ValueError(f"Path does not exist: {raw_path}")
-    if not os.path.isdir(path):
-        raise ValueError(f"Path is not a directory: {raw_path}")
-    return path
+def raw_path(value: str) -> bytes:
+    return os.fsencode(value)
 
 
-def is_same_or_child(path: str, excluded: str) -> bool:
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def utc_timestamp(ns: int | None) -> str:
+    if ns is None:
+        return ""
+    return datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc).isoformat()
+
+
+def human_bytes(value: float | int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    size = float(value)
+    for unit in units:
+        if abs(size) < 1024.0 or unit == units[-1]:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} PiB"
+
+
+def allocated_bytes_from_stat(info: os.stat_result) -> int | None:
+    blocks = getattr(info, "st_blocks", None)
+    if blocks is None:
+        return None
+    return int(blocks) * 512
+
+
+def normalize_existing_directory(raw_value: str) -> str:
+    expanded = os.path.expanduser(raw_value)
+    resolved = os.path.realpath(os.path.abspath(expanded))
+    if not os.path.exists(resolved):
+        raise ValueError(f"Path does not exist: {raw_value}")
+    if not os.path.isdir(resolved):
+        raise ValueError(f"Path is not a directory: {raw_value}")
+    return resolved
+
+
+def is_same_or_child(path: str, parent: str) -> bool:
     try:
-        return os.path.commonpath((path, excluded)) == excluded
+        return os.path.commonpath((path, parent)) == parent
     except ValueError:
         return False
 
 
+def validate_roots(raw_roots: Sequence[str]) -> list[str]:
+    roots: list[str] = []
+    seen: set[str] = set()
+    for raw_root in raw_roots:
+        root = normalize_existing_directory(raw_root)
+        if root not in seen:
+            roots.append(root)
+            seen.add(root)
+    return roots
+
+
+def nested_root_excludes(roots: Sequence[RootInfo]) -> dict[int, tuple[str, ...]]:
+    """Partition overlapping roots so each pathname is yielded exactly once.
+
+    For example, with roots '/' and '/mnt/windows', the parent-root walk skips
+    '/mnt/windows' while the child-root walk scans it normally. This supports the
+    common --one-file-system multi-volume pattern without false duplicates.
+    """
+    result: dict[int, tuple[str, ...]] = {}
+    for parent in roots:
+        children = [
+            child.path
+            for child in roots
+            if child.root_id != parent.root_id and is_same_or_child(child.path, parent.path)
+        ]
+        result[parent.root_id] = tuple(sorted(children, key=len))
+    return result
+
+
 def automatic_excludes(roots: Sequence[str]) -> list[str]:
-    """Avoid Linux pseudo-filesystems only when scanning the live root '/'."""
-    if os.path.abspath(os.sep) not in roots:
+    if os.path.realpath(os.sep) not in roots:
         return []
     return ["/proc", "/sys", "/dev", "/run"]
 
@@ -227,76 +509,559 @@ def make_hasher(algorithm: str) -> Callable[[], object]:
     raise ValueError(f"Unsupported algorithm: {algorithm}")
 
 
-def utc_mtime(mtime_ns: int | None) -> str:
-    if mtime_ns is None:
-        return ""
-    return datetime.fromtimestamp(mtime_ns / 1_000_000_000, tz=timezone.utc).isoformat()
+def read_mountinfo() -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                fields = line.rstrip("\n").split()
+                try:
+                    separator = fields.index("-")
+                except ValueError:
+                    continue
+                if len(fields) < 10 or separator + 2 >= len(fields):
+                    continue
+                entries.append(
+                    {
+                        "major_minor": fields[2],
+                        "mount_point": fields[4].replace("\\040", " "),
+                        "filesystem_type": fields[separator + 1],
+                        "mount_source": fields[separator + 2].replace("\\040", " "),
+                    }
+                )
+    except OSError:
+        pass
+    return entries
 
 
-def human_bytes(value: float) -> str:
-    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
-    size = float(value)
-    for unit in units:
-        if abs(size) < 1024.0 or unit == units[-1]:
-            return f"{size:.2f} {unit}"
-        size /= 1024.0
-    return f"{size:.2f} PiB"
+def device_uuid_map() -> dict[str, str]:
+    result: dict[str, str] = {}
+    base = Path("/dev/disk/by-uuid")
+    try:
+        for entry in base.iterdir():
+            try:
+                target = os.path.realpath(entry)
+                result[target] = entry.name
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return result
+
+
+def mount_details(path: str, info: os.stat_result) -> tuple[str, str, str, str]:
+    major_minor = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
+    candidates = [
+        entry
+        for entry in read_mountinfo()
+        if entry["major_minor"] == major_minor and is_same_or_child(path, entry["mount_point"])
+    ]
+    if candidates:
+        selected = max(candidates, key=lambda entry: len(entry["mount_point"]))
+        source = selected["mount_source"]
+        fs_uuid = device_uuid_map().get(os.path.realpath(source), "")
+        return (
+            selected["mount_point"],
+            selected["filesystem_type"],
+            source,
+            fs_uuid,
+        )
+    return (path, "unknown", "unknown", "")
+
+
+def configure_logging(log_path: Path, detail: str) -> logging.Logger:
+    logger = logging.getLogger(PROGRAM_NAME)
+    logger.setLevel(logging.DEBUG if detail == "trace" else logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    logger.addHandler(stream)
+    file_handler = logging.FileHandler(
+        log_path, mode="a", encoding="utf-8", errors="backslashreplace"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    try:
+        os.chmod(log_path, 0o600)
+    except OSError:
+        pass
+    return logger
+
+
+@contextlib.contextmanager
+def restrictive_umask() -> Iterator[None]:
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def secure_output_directory(path: Path) -> None:
+    with restrictive_umask():
+        path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def create_schema(connection: sqlite3.Connection) -> None:
+    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(files)")}
+    if existing_columns and "scan_id" not in existing_columns:
+        raise RuntimeError(
+            "This is a legacy HashWatchDog database and cannot be reused incrementally. "
+            "Run without --incremental, or move the old database to an archive directory."
+        )
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS scans (
+            scan_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            started_utc TEXT NOT NULL,
+            ended_utc TEXT,
+            hostname TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            python_version TEXT NOT NULL,
+            program_version TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            algorithm TEXT NOT NULL,
+            config_fingerprint TEXT NOT NULL,
+            invocation_json TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 1,
+            interrupted_reason TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS roots (
+            id INTEGER PRIMARY KEY,
+            scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            path_display TEXT NOT NULL,
+            path_raw BLOB NOT NULL,
+            device INTEGER NOT NULL,
+            mount_point TEXT NOT NULL,
+            filesystem_type TEXT NOT NULL,
+            mount_source TEXT NOT NULL,
+            filesystem_uuid TEXT NOT NULL,
+            UNIQUE(scan_id, path_raw)
+        );
+
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY,
+            scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
+            root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+            path_display TEXT NOT NULL,
+            path_raw BLOB NOT NULL,
+            size_bytes INTEGER,
+            allocated_bytes INTEGER,
+            mtime_ns INTEGER,
+            ctime_ns INTEGER,
+            device INTEGER,
+            inode INTEGER,
+            digest TEXT NOT NULL,
+            sample_digest TEXT NOT NULL,
+            algorithm TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT NOT NULL,
+            bytes_read INTEGER NOT NULL,
+            elapsed_seconds REAL NOT NULL,
+            management_class TEXT NOT NULL,
+            classification_confidence TEXT NOT NULL,
+            classification_reason TEXT NOT NULL,
+            cleanup_risk TEXT NOT NULL,
+            seen_generation INTEGER NOT NULL,
+            reused_from_file_id INTEGER,
+            UNIQUE(scan_id, path_raw)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_files_scan_digest_size
+            ON files(scan_id, status, digest, size_bytes);
+        CREATE INDEX IF NOT EXISTS idx_files_scan_device_inode
+            ON files(scan_id, device, inode);
+        CREATE INDEX IF NOT EXISTS idx_files_scan_path_display
+            ON files(scan_id, path_display);
+        CREATE INDEX IF NOT EXISTS idx_files_reuse_lookup
+            ON files(path_raw, algorithm, size_bytes, mtime_ns, ctime_ns, device, inode, status);
+        CREATE INDEX IF NOT EXISTS idx_scans_state_started
+            ON scans(state, started_utc);
+        """
+    )
+    current_columns = {row[1] for row in connection.execute("PRAGMA table_info(files)")}
+    if "sample_digest" not in current_columns:
+        connection.execute("ALTER TABLE files ADD COLUMN sample_digest TEXT NOT NULL DEFAULT ''")
+    connection.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+        (str(SCHEMA_VERSION),),
+    )
+    connection.commit()
+
+
+def open_database(path: Path) -> sqlite3.Connection:
+    with restrictive_umask():
+        connection = sqlite3.connect(path, timeout=60.0)
+    connection.row_factory = sqlite3.Row
+    create_schema(connection)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return connection
+
+
+def sqlite_backup(source: Path, destination: Path) -> None:
+    with sqlite3.connect(source) as source_conn:
+        with restrictive_umask():
+            destination_conn = sqlite3.connect(destination)
+        try:
+            source_conn.backup(destination_conn)
+            destination_conn.commit()
+        finally:
+            destination_conn.close()
+
+
+def configuration_payload(args: argparse.Namespace, roots: Sequence[str], excludes: Sequence[str]) -> dict[str, object]:
+    return {
+        "roots": [safe_display(root) for root in roots],
+        "roots_raw_hex": [raw_path(root).hex() for root in roots],
+        "excludes_raw_hex": sorted(raw_path(path).hex() for path in excludes),
+        "algorithm": args.algorithm,
+        "one_file_system": bool(args.one_file_system),
+        "empty_files": args.empty_files,
+        "chunk_size_mib": int(args.chunk_size_mib),
+        "managed_classification": not bool(args.no_managed_classification),
+    }
+
+
+def fingerprint(payload: dict[str, object]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def initialize_new_scan(
+    connection: sqlite3.Connection,
+    args: argparse.Namespace,
+    roots: Sequence[str],
+    config_fingerprint: str,
+) -> tuple[str, int, list[RootInfo]]:
+    scan_id = str(uuid.uuid4())
+    invocation = {
+        "argv": [safe_display(arg) for arg in sys.argv],
+        "cwd": safe_display(os.getcwd()),
+    }
+    connection.execute(
+        """
+        INSERT INTO scans(
+            scan_id, state, started_utc, hostname, platform, python_version,
+            program_version, schema_version, algorithm, config_fingerprint,
+            invocation_json, generation
+        ) VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """,
+        (
+            scan_id,
+            utc_now(),
+            socket.gethostname(),
+            platform.platform(),
+            platform.python_version(),
+            VERSION,
+            SCHEMA_VERSION,
+            args.algorithm,
+            config_fingerprint,
+            json.dumps(invocation, ensure_ascii=True),
+        ),
+    )
+    root_infos: list[RootInfo] = []
+    for ordinal, root in enumerate(roots, start=1):
+        info = os.stat(root, follow_symlinks=False)
+        mount_point, fs_type, source, fs_uuid = mount_details(root, info)
+        cursor = connection.execute(
+            """
+            INSERT INTO roots(
+                scan_id, ordinal, path_display, path_raw, device, mount_point,
+                filesystem_type, mount_source, filesystem_uuid
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scan_id,
+                ordinal,
+                safe_display(root),
+                sqlite3.Binary(raw_path(root)),
+                info.st_dev,
+                safe_display(mount_point),
+                safe_display(fs_type),
+                safe_display(source),
+                safe_display(fs_uuid),
+            ),
+        )
+        root_infos.append(
+            RootInfo(
+                root_id=int(cursor.lastrowid),
+                path=root,
+                path_display=safe_display(root),
+                path_raw=raw_path(root),
+                device=info.st_dev,
+                mount_point=safe_display(mount_point),
+                filesystem_type=safe_display(fs_type),
+                mount_source=safe_display(source),
+                filesystem_uuid=safe_display(fs_uuid),
+            )
+        )
+    connection.commit()
+    return scan_id, 1, root_infos
+
+
+def resume_scan(
+    connection: sqlite3.Connection,
+    config_fingerprint: str,
+) -> tuple[str, int, list[RootInfo]]:
+    row = connection.execute(
+        """
+        SELECT * FROM scans
+        WHERE state IN ('running', 'interrupted', 'failed')
+        ORDER BY started_utc DESC LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        raise ValueError("No interrupted scan exists in the partial database.")
+    if row["config_fingerprint"] != config_fingerprint:
+        raise ValueError(
+            "The interrupted scan configuration does not match this invocation. "
+            "Use the same roots, exclusions, algorithm, filesystem policy, and empty-file policy."
+        )
+    scan_id = str(row["scan_id"])
+    generation = int(row["generation"]) + 1
+    connection.execute(
+        """
+        UPDATE scans
+        SET state='running', ended_utc=NULL, interrupted_reason='', generation=?
+        WHERE scan_id=?
+        """,
+        (generation, scan_id),
+    )
+    roots: list[RootInfo] = []
+    for root in connection.execute(
+        "SELECT * FROM roots WHERE scan_id=? ORDER BY ordinal", (scan_id,)
+    ):
+        path = os.fsdecode(bytes(root["path_raw"]))
+        roots.append(
+            RootInfo(
+                root_id=int(root["id"]),
+                path=path,
+                path_display=str(root["path_display"]),
+                path_raw=bytes(root["path_raw"]),
+                device=int(root["device"]),
+                mount_point=str(root["mount_point"]),
+                filesystem_type=str(root["filesystem_type"]),
+                mount_source=str(root["mount_source"]),
+                filesystem_uuid=str(root["filesystem_uuid"]),
+            )
+        )
+    connection.commit()
+    return scan_id, generation, roots
+
+
+def latest_completed_scan_id(connection: sqlite3.Connection, algorithm: str) -> str | None:
+    row = connection.execute(
+        """
+        SELECT scan_id FROM scans
+        WHERE state='completed' AND algorithm=?
+        ORDER BY ended_utc DESC LIMIT 1
+        """,
+        (algorithm,),
+    ).fetchone()
+    return None if row is None else str(row["scan_id"])
+
+
+def classify_path(root: str, path: str, enabled: bool) -> tuple[str, str, str, str]:
+    if not enabled:
+        return ("unclassified", "none", "classification disabled", "medium")
+
+    try:
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+    except ValueError:
+        relative = path.replace(os.sep, "/")
+    lowered = "/" + relative.lower().lstrip("/")
+
+    content_addressed_markers = (
+        "/.git/objects/",
+        "/nix/store/",
+        "/var/lib/docker/overlay2/",
+        "/var/lib/containers/storage/",
+        "/cas/",
+    )
+    if any(marker in lowered for marker in content_addressed_markers):
+        return (
+            "content-addressed",
+            "high",
+            "path matches a content-addressed or container storage area",
+            "high",
+        )
+
+    critical_prefixes = (
+        "/boot/",
+        "/etc/",
+        "/bin/",
+        "/sbin/",
+        "/lib/",
+        "/lib32/",
+        "/lib64/",
+        "/windows/",
+        "/windows/system32/",
+    )
+    if lowered == "/boot" or any(lowered.startswith(prefix) for prefix in critical_prefixes):
+        return (
+            "system-critical",
+            "high",
+            "path is inside an operating-system or boot-critical area",
+            "critical",
+        )
+
+    package_prefixes = (
+        "/usr/",
+        "/var/lib/dpkg/",
+        "/var/lib/rpm/",
+        "/var/lib/pacman/",
+        "/var/cache/apt/",
+        "/var/cache/dnf/",
+        "/var/cache/pacman/",
+    )
+    if any(lowered.startswith(prefix) for prefix in package_prefixes):
+        return (
+            "package-managed",
+            "high",
+            "path is inside a package-manager or system package area",
+            "critical" if lowered.startswith("/usr/") else "high",
+        )
+
+    application_markers = (
+        "/.steam/",
+        "/steamapps/",
+        "/flatpak/",
+        "/.var/app/",
+        "/snap/",
+        "/appdata/",
+        "/program files/",
+        "/program files (x86)/",
+        "/programdata/",
+        "/jetbrains/",
+        "/pycharm",
+        "/node_modules/",
+        "/site-packages/",
+    )
+    if any(marker in lowered for marker in application_markers):
+        return (
+            "application-managed",
+            "medium",
+            "path matches an application-managed runtime, cache, or installation area",
+            "high",
+        )
+
+    return (
+        "user-managed",
+        "medium",
+        "path does not match a known managed-content area",
+        "low",
+    )
 
 
 def walk_files(
-    roots: Sequence[str],
+    roots: Sequence[RootInfo],
     excludes: Sequence[str],
     one_file_system: bool,
+    generation: int,
     logger: logging.Logger,
+    cancel_event: threading.Event,
 ) -> Iterator[FileTask]:
-    normalized_excludes = tuple(os.path.abspath(path) for path in excludes)
-
+    normalized_excludes = tuple(os.path.realpath(path) for path in excludes)
+    nested_excludes = nested_root_excludes(roots)
     for root in roots:
-        try:
-            root_stat = os.stat(root, follow_symlinks=False)
-        except OSError as exc:
-            logger.error("Cannot stat root %s: %s", root, exc)
-            continue
-
-        root_device = root_stat.st_dev
-        stack = [root]
-
-        while stack:
+        root_excludes = normalized_excludes + nested_excludes.get(root.root_id, ())
+        stack = [root.path]
+        while stack and not cancel_event.is_set():
             directory = stack.pop()
-            if any(is_same_or_child(directory, excluded) for excluded in normalized_excludes):
-                logger.info("Excluded directory: %s", directory)
+            if any(is_same_or_child(directory, excluded) for excluded in root_excludes):
                 continue
-
             try:
                 with os.scandir(directory) as entries:
                     for entry in entries:
+                        if cancel_event.is_set():
+                            return
                         path = entry.path
-                        if any(
-                            is_same_or_child(path, excluded)
-                            for excluded in normalized_excludes
-                        ):
+                        if any(is_same_or_child(path, excluded) for excluded in root_excludes):
                             continue
-
                         try:
                             if entry.is_symlink():
                                 continue
-
-                            if entry.is_dir(follow_symlinks=False):
-                                if one_file_system:
-                                    try:
-                                        if entry.stat(follow_symlinks=False).st_dev != root_device:
-                                            logger.info("Skipped mount point: %s", path)
-                                            continue
-                                    except OSError as exc:
-                                        logger.warning("Cannot stat directory %s: %s", path, exc)
-                                        continue
+                            info = entry.stat(follow_symlinks=False)
+                            if stat.S_ISDIR(info.st_mode):
+                                if one_file_system and info.st_dev != root.device:
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug("Skipped mount point: %s", safe_display(path))
+                                    continue
                                 stack.append(path)
-                            elif entry.is_file(follow_symlinks=False):
-                                yield FileTask(root=root, path=path)
+                            elif stat.S_ISREG(info.st_mode):
+                                yield FileTask(
+                                    root=root,
+                                    path=path,
+                                    path_display=safe_display(path),
+                                    path_raw=raw_path(path),
+                                    size_bytes=int(info.st_size),
+                                    allocated_bytes=allocated_bytes_from_stat(info),
+                                    mtime_ns=int(info.st_mtime_ns),
+                                    ctime_ns=int(info.st_ctime_ns),
+                                    device=int(info.st_dev),
+                                    inode=int(info.st_ino),
+                                    nlink=int(info.st_nlink),
+                                    generation=generation,
+                                )
                         except OSError as exc:
-                            logger.warning("Cannot inspect %s: %s", path, exc)
+                            logger.warning("Cannot inspect %s: %s", safe_display(path), exc)
             except OSError as exc:
-                logger.warning("Cannot enter directory %s: %s", directory, exc)
+                logger.warning("Cannot enter directory %s: %s", safe_display(directory), exc)
+
+
+def open_regular_no_follow(path: str) -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags)
+
+
+def metadata_changed(before: os.stat_result, after: os.stat_result, bytes_read: int) -> bool:
+    return (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or bytes_read != after.st_size
+    )
+
+
+def path_still_names_descriptor(path: str, descriptor_info: os.stat_result) -> bool:
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return current.st_dev == descriptor_info.st_dev and current.st_ino == descriptor_info.st_ino
+
+
+def empty_digest(hasher_factory: Callable[[], object]) -> str:
+    return hasher_factory().hexdigest()  # type: ignore[attr-defined]
 
 
 def hash_one_file(
@@ -304,209 +1069,642 @@ def hash_one_file(
     hasher_factory: Callable[[], object],
     chunk_size: int,
     retries: int,
-    ignore_empty: bool,
+    empty_policy: str,
+    tracker: ProgressTracker,
+    cancel_event: threading.Event,
+    classification_enabled: bool,
 ) -> HashResult:
-    started = time.monotonic()
-    last_error = ""
+    overall_started = time.monotonic()
+    total_bytes_read = 0
+    management = classify_path(task.root.path, task.path, classification_enabled)
 
-    for attempt in range(retries + 1):
+    for attempt_index in range(retries + 1):
+        attempt = attempt_index + 1
+        fd: int | None = None
+        progress_key: int | None = None
+        attempt_bytes = 0
         try:
-            before = os.stat(task.path, follow_symlinks=False)
-            if not os.path.isfile(task.path):
-                raise OSError("Path is no longer a regular file")
+            if cancel_event.is_set():
+                raise ScanInterrupted("scan cancellation requested")
+            fd = open_regular_no_follow(task.path)
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise OSError(errno.EINVAL, "Path is no longer a regular file")
 
-            if ignore_empty and before.st_size == 0:
+            if before.st_size == 0:
+                status = (
+                    "empty_reported" if empty_policy == "report"
+                    else "empty_ignored" if empty_policy == "ignore"
+                    else "empty"
+                )
+                digest = empty_digest(hasher_factory) if empty_policy == "report" else ""
                 return HashResult(
-                    root=task.root,
-                    path=task.path,
-                    size_bytes=0,
-                    mtime_ns=before.st_mtime_ns,
-                    device=before.st_dev,
-                    inode=before.st_ino,
-                    digest="",
-                    status="ignored_empty",
+                    task=task,
+                    digest=digest,
+                    sample_digest=sample_digest_fd(fd, 0),
+                    status=status,
                     error="",
-                    bytes_read=0,
-                    elapsed_seconds=time.monotonic() - started,
+                    bytes_read=total_bytes_read,
+                    elapsed_seconds=time.monotonic() - overall_started,
+                    final_size_bytes=0,
+                    final_allocated_bytes=allocated_bytes_from_stat(before),
+                    final_mtime_ns=before.st_mtime_ns,
+                    final_ctime_ns=before.st_ctime_ns,
+                    final_device=before.st_dev,
+                    final_inode=before.st_ino,
+                    management_class=management[0],
+                    classification_confidence=management[1],
+                    classification_reason=management[2],
+                    cleanup_risk=management[3],
                 )
 
             hasher = hasher_factory()
-            bytes_read = 0
-            buffer = bytearray(chunk_size)
+            buffer = worker_buffer(chunk_size)
             view = memoryview(buffer)
-
-            with open(task.path, "rb", buffering=0) as handle:
-                while True:
-                    count = handle.readinto(buffer)
+            progress_key = tracker.start_file(task.path_display, int(before.st_size), attempt)
+            while True:
+                if cancel_event.is_set():
+                    raise ScanInterrupted("scan cancellation requested")
+                count = os.readv(fd, [buffer]) if hasattr(os, "readv") else os.read(fd, chunk_size)
+                if isinstance(count, bytes):
                     if not count:
                         break
+                    hasher.update(count)  # type: ignore[attr-defined]
+                    read_count = len(count)
+                else:
+                    if count == 0:
+                        break
                     hasher.update(view[:count])  # type: ignore[attr-defined]
-                    bytes_read += count
+                    read_count = int(count)
+                attempt_bytes += read_count
+                total_bytes_read += read_count
+                tracker.add_bytes(progress_key, read_count)
 
-            after = os.stat(task.path, follow_symlinks=False)
-            changed = (
-                before.st_size != after.st_size
-                or before.st_mtime_ns != after.st_mtime_ns
-                or bytes_read != after.st_size
-            )
-            if changed:
-                last_error = "File changed while being hashed"
-                if attempt < retries:
+            after = os.fstat(fd)
+            changed = metadata_changed(before, after, attempt_bytes)
+            path_mismatch = not path_still_names_descriptor(task.path, after)
+            if changed or path_mismatch:
+                reason = (
+                    "Path no longer names the hashed file"
+                    if path_mismatch
+                    else "File changed while being hashed"
+                )
+                if attempt_index < retries:
                     continue
                 return HashResult(
-                    root=task.root,
-                    path=task.path,
-                    size_bytes=after.st_size,
-                    mtime_ns=after.st_mtime_ns,
-                    device=after.st_dev,
-                    inode=after.st_ino,
+                    task=task,
                     digest="",
+                    sample_digest="",
                     status="changed",
-                    error=last_error,
-                    bytes_read=bytes_read,
-                    elapsed_seconds=time.monotonic() - started,
+                    error=reason,
+                    bytes_read=total_bytes_read,
+                    elapsed_seconds=time.monotonic() - overall_started,
+                    final_size_bytes=after.st_size,
+                    final_allocated_bytes=allocated_bytes_from_stat(after),
+                    final_mtime_ns=after.st_mtime_ns,
+                    final_ctime_ns=after.st_ctime_ns,
+                    final_device=after.st_dev,
+                    final_inode=after.st_ino,
+                    management_class=management[0],
+                    classification_confidence=management[1],
+                    classification_reason=management[2],
+                    cleanup_risk=management[3],
                 )
 
             return HashResult(
-                root=task.root,
-                path=task.path,
-                size_bytes=after.st_size,
-                mtime_ns=after.st_mtime_ns,
-                device=after.st_dev,
-                inode=after.st_ino,
+                task=task,
                 digest=hasher.hexdigest(),  # type: ignore[attr-defined]
+                sample_digest=sample_digest_fd(fd, int(after.st_size)),
                 status="ok",
                 error="",
-                bytes_read=bytes_read,
-                elapsed_seconds=time.monotonic() - started,
+                bytes_read=total_bytes_read,
+                elapsed_seconds=time.monotonic() - overall_started,
+                final_size_bytes=after.st_size,
+                final_allocated_bytes=allocated_bytes_from_stat(after),
+                final_mtime_ns=after.st_mtime_ns,
+                final_ctime_ns=after.st_ctime_ns,
+                final_device=after.st_dev,
+                final_inode=after.st_ino,
+                management_class=management[0],
+                classification_confidence=management[1],
+                classification_reason=management[2],
+                cleanup_risk=management[3],
             )
-        except (OSError, PermissionError) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+        except ScanInterrupted as exc:
             return HashResult(
-                root=task.root,
-                path=task.path,
-                size_bytes=None,
-                mtime_ns=None,
-                device=None,
-                inode=None,
+                task=task,
                 digest="",
-                status="error",
-                error=last_error,
-                bytes_read=0,
-                elapsed_seconds=time.monotonic() - started,
+                sample_digest="",
+                status="cancelled",
+                error=str(exc),
+                bytes_read=total_bytes_read,
+                elapsed_seconds=time.monotonic() - overall_started,
+                final_size_bytes=None,
+                final_allocated_bytes=None,
+                final_mtime_ns=None,
+                final_ctime_ns=None,
+                final_device=None,
+                final_inode=None,
+                management_class=management[0],
+                classification_confidence=management[1],
+                classification_reason=management[2],
+                cleanup_risk=management[3],
             )
-        except Exception as exc:  # defensive: preserve the rest of a long scan
-            last_error = f"Unexpected {type(exc).__name__}: {exc}"
+        except OSError as exc:
             return HashResult(
-                root=task.root,
-                path=task.path,
-                size_bytes=None,
-                mtime_ns=None,
-                device=None,
-                inode=None,
+                task=task,
                 digest="",
+                sample_digest="",
                 status="error",
-                error=last_error,
-                bytes_read=0,
-                elapsed_seconds=time.monotonic() - started,
+                error=f"{type(exc).__name__}: {exc}",
+                bytes_read=total_bytes_read,
+                elapsed_seconds=time.monotonic() - overall_started,
+                final_size_bytes=None,
+                final_allocated_bytes=None,
+                final_mtime_ns=None,
+                final_ctime_ns=None,
+                final_device=None,
+                final_inode=None,
+                management_class=management[0],
+                classification_confidence=management[1],
+                classification_reason=management[2],
+                cleanup_risk=management[3],
             )
+        except Exception as exc:  # preserve the remainder of a long scan
+            return HashResult(
+                task=task,
+                digest="",
+                sample_digest="",
+                status="error",
+                error=f"Unexpected {type(exc).__name__}: {exc}",
+                bytes_read=total_bytes_read,
+                elapsed_seconds=time.monotonic() - overall_started,
+                final_size_bytes=None,
+                final_allocated_bytes=None,
+                final_mtime_ns=None,
+                final_ctime_ns=None,
+                final_device=None,
+                final_inode=None,
+                management_class=management[0],
+                classification_confidence=management[1],
+                classification_reason=management[2],
+                cleanup_risk=management[3],
+            )
+        finally:
+            if progress_key is not None:
+                tracker.finish_file(progress_key)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
-    raise AssertionError("Unreachable hashing state")
+    raise AssertionError("unreachable hashing state")
 
 
-def create_database(db_path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(db_path)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY,
-            root TEXT NOT NULL,
-            path TEXT NOT NULL,
-            size_bytes INTEGER,
-            mtime_ns INTEGER,
-            device INTEGER,
-            inode INTEGER,
-            digest TEXT NOT NULL,
-            status TEXT NOT NULL,
-            error TEXT NOT NULL
-        )
-        """
+def metadata_matches(task: FileTask, row: sqlite3.Row) -> bool:
+    return (
+        row["size_bytes"] == task.size_bytes
+        and row["mtime_ns"] == task.mtime_ns
+        and row["ctime_ns"] == task.ctime_ns
+        and row["device"] == task.device
+        and row["inode"] == task.inode
     )
-    connection.execute("DELETE FROM files")
-    connection.commit()
-    return connection
 
 
-def write_result(
+def sample_digest_fd(fd: int, size: int, sample_size: int = 64 * 1024) -> str:
+    """Hash deterministic beginning/middle/end samples without changing content semantics."""
+    hasher = hashlib.blake2b(digest_size=16)
+    positions = [0]
+    if size > sample_size:
+        positions.append(max((size // 2) - (sample_size // 2), 0))
+        positions.append(max(size - sample_size, 0))
+    seen: set[int] = set()
+    original_offset = os.lseek(fd, 0, os.SEEK_CUR)
+    try:
+        for position in positions:
+            if position in seen:
+                continue
+            seen.add(position)
+            os.lseek(fd, position, os.SEEK_SET)
+            data = os.read(fd, min(sample_size, max(size - position, 0)))
+            hasher.update(position.to_bytes(8, "little", signed=False))
+            hasher.update(data)
+        return hasher.hexdigest()
+    finally:
+        os.lseek(fd, original_offset, os.SEEK_SET)
+
+
+def sample_digest(path: str, size: int, sample_size: int = 64 * 1024) -> str:
+    fd = open_regular_no_follow(path)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            raise OSError(errno.EAGAIN, "file metadata changed before sample verification")
+        digest = sample_digest_fd(fd, size, sample_size)
+        after = os.fstat(fd)
+        if metadata_changed(info, after, size):
+            raise OSError(errno.EAGAIN, "file changed during sample verification")
+        return digest
+    finally:
+        os.close(fd)
+
+
+def resumable_row(
     connection: sqlite3.Connection,
-    csv_writer: csv.writer,
-    result: HashResult,
-) -> None:
-    csv_writer.writerow(
-        (
-            result.root,
-            result.path,
-            "" if result.size_bytes is None else result.size_bytes,
-            utc_mtime(result.mtime_ns),
-            result.digest,
-            result.status,
-            result.error,
-            "" if result.device is None else result.device,
-            "" if result.inode is None else result.inode,
-        )
-    )
-    connection.execute(
+    scan_id: str,
+    task: FileTask,
+) -> sqlite3.Row | None:
+    row = connection.execute(
+        "SELECT * FROM files WHERE scan_id=? AND path_raw=?",
+        (scan_id, sqlite3.Binary(task.path_raw)),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["status"] not in ("ok", "empty", "empty_ignored", "empty_reported", "reused"):
+        return None
+    return row if metadata_matches(task, row) else None
+
+
+def incremental_row(
+    connection: sqlite3.Connection,
+    previous_scan_id: str | None,
+    task: FileTask,
+    algorithm: str,
+    policy: str,
+) -> sqlite3.Row | None:
+    if previous_scan_id is None or policy == "strict":
+        return None
+    row = connection.execute(
         """
-        INSERT INTO files
-            (root, path, size_bytes, mtime_ns, device, inode, digest, status, error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        SELECT * FROM files
+        WHERE scan_id=? AND path_raw=? AND algorithm=?
+          AND status IN ('ok', 'empty', 'empty_ignored', 'empty_reported', 'reused')
+        """,
+        (previous_scan_id, sqlite3.Binary(task.path_raw), algorithm),
+    ).fetchone()
+    if row is None or not metadata_matches(task, row):
+        return None
+    if policy == "sampled" and task.size_bytes > 0:
+        stored_sample = str(row["sample_digest"] or "")
+        if not stored_sample:
+            return None
+        try:
+            if sample_digest(task.path, task.size_bytes) != stored_sample:
+                return None
+        except OSError:
+            return None
+    return row
+
+
+def current_identity_row(
+    connection: sqlite3.Connection,
+    scan_id: str,
+    task: FileTask,
+) -> sqlite3.Row | None:
+    if task.nlink <= 1:
+        return None
+    return connection.execute(
+        """
+        SELECT * FROM files
+        WHERE scan_id=? AND device=? AND inode=? AND size_bytes=?
+          AND mtime_ns=? AND ctime_ns=?
+          AND status IN ('ok','reused','empty','empty_ignored','empty_reported')
+        LIMIT 1
         """,
         (
-            result.root,
-            result.path,
-            result.size_bytes,
-            result.mtime_ns,
-            result.device,
-            result.inode,
-            result.digest,
-            result.status,
-            result.error,
+            scan_id,
+            task.device,
+            task.inode,
+            task.size_bytes,
+            task.mtime_ns,
+            task.ctime_ns,
+        ),
+    ).fetchone()
+
+
+def mark_seen(connection: sqlite3.Connection, file_id: int, generation: int) -> None:
+    connection.execute(
+        "UPDATE files SET seen_generation=? WHERE id=?", (generation, file_id)
+    )
+
+
+def copy_reused_row(
+    connection: sqlite3.Connection,
+    scan_id: str,
+    task: FileTask,
+    source: sqlite3.Row,
+    generation: int,
+    classification_enabled: bool,
+) -> None:
+    management = classify_path(task.root.path, task.path, classification_enabled)
+    connection.execute(
+        """
+        INSERT INTO files(
+            scan_id, root_id, path_display, path_raw, size_bytes, allocated_bytes,
+            mtime_ns, ctime_ns, device, inode, digest, sample_digest, algorithm, status, error,
+            bytes_read, elapsed_seconds, management_class,
+            classification_confidence, classification_reason, cleanup_risk,
+            seen_generation, reused_from_file_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reused', '', 0, 0.0, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scan_id, path_raw) DO UPDATE SET
+            root_id=excluded.root_id,
+            path_display=excluded.path_display,
+            size_bytes=excluded.size_bytes,
+            allocated_bytes=excluded.allocated_bytes,
+            mtime_ns=excluded.mtime_ns,
+            ctime_ns=excluded.ctime_ns,
+            device=excluded.device,
+            inode=excluded.inode,
+            digest=excluded.digest,
+            sample_digest=excluded.sample_digest,
+            algorithm=excluded.algorithm,
+            status='reused',
+            error='',
+            bytes_read=0,
+            elapsed_seconds=0.0,
+            management_class=excluded.management_class,
+            classification_confidence=excluded.classification_confidence,
+            classification_reason=excluded.classification_reason,
+            cleanup_risk=excluded.cleanup_risk,
+            seen_generation=excluded.seen_generation,
+            reused_from_file_id=excluded.reused_from_file_id
+        """,
+        (
+            scan_id,
+            task.root.root_id,
+            task.path_display,
+            sqlite3.Binary(task.path_raw),
+            task.size_bytes,
+            task.allocated_bytes,
+            task.mtime_ns,
+            task.ctime_ns,
+            task.device,
+            task.inode,
+            source["digest"],
+            source["sample_digest"],
+            source["algorithm"],
+            management[0],
+            management[1],
+            management[2],
+            management[3],
+            generation,
+            source["id"],
         ),
     )
 
 
+def write_result(
+    connection: sqlite3.Connection,
+    scan_id: str,
+    algorithm: str,
+    result: HashResult,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO files(
+            scan_id, root_id, path_display, path_raw, size_bytes, allocated_bytes,
+            mtime_ns, ctime_ns, device, inode, digest, sample_digest, algorithm, status, error,
+            bytes_read, elapsed_seconds, management_class,
+            classification_confidence, classification_reason, cleanup_risk,
+            seen_generation, reused_from_file_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(scan_id, path_raw) DO UPDATE SET
+            root_id=excluded.root_id,
+            path_display=excluded.path_display,
+            size_bytes=excluded.size_bytes,
+            allocated_bytes=excluded.allocated_bytes,
+            mtime_ns=excluded.mtime_ns,
+            ctime_ns=excluded.ctime_ns,
+            device=excluded.device,
+            inode=excluded.inode,
+            digest=excluded.digest,
+            sample_digest=excluded.sample_digest,
+            algorithm=excluded.algorithm,
+            status=excluded.status,
+            error=excluded.error,
+            bytes_read=excluded.bytes_read,
+            elapsed_seconds=excluded.elapsed_seconds,
+            management_class=excluded.management_class,
+            classification_confidence=excluded.classification_confidence,
+            classification_reason=excluded.classification_reason,
+            cleanup_risk=excluded.cleanup_risk,
+            seen_generation=excluded.seen_generation,
+            reused_from_file_id=NULL
+        """,
+        (
+            scan_id,
+            result.task.root.root_id,
+            result.task.path_display,
+            sqlite3.Binary(result.task.path_raw),
+            result.final_size_bytes,
+            result.final_allocated_bytes,
+            result.final_mtime_ns,
+            result.final_ctime_ns,
+            result.final_device,
+            result.final_inode,
+            result.digest,
+            result.sample_digest,
+            algorithm,
+            result.status,
+            result.error,
+            result.bytes_read,
+            result.elapsed_seconds,
+            result.management_class,
+            result.classification_confidence,
+            result.classification_reason,
+            result.cleanup_risk,
+            result.task.generation,
+        ),
+    )
+
+
+def update_counters(
+    counters: Counters,
+    counters_lock: threading.Lock,
+    result: HashResult,
+) -> None:
+    with counters_lock:
+        counters.examined += 1
+        if result.status == "ok":
+            counters.hashed += 1
+        elif result.status in ("empty", "empty_reported"):
+            counters.empty += 1
+        elif result.status == "changed":
+            counters.changed += 1
+        elif result.status == "cancelled":
+            counters.cancelled += 1
+        elif result.status == "error":
+            counters.errors += 1
+
+
+def process_results(
+    futures: Iterable[Future[HashResult]],
+    connection: sqlite3.Connection,
+    scan_id: str,
+    algorithm: str,
+    counters: Counters,
+    counters_lock: threading.Lock,
+    logger: logging.Logger,
+    print_hashes: bool,
+) -> None:
+    for future in futures:
+        result = future.result()
+        write_result(connection, scan_id, algorithm, result)
+        update_counters(counters, counters_lock, result)
+        if print_hashes and result.status in ("ok", "reused", "empty_reported"):
+            logger.info("HASH %s %s  %s", algorithm, result.digest, result.task.path_display)
+        if result.status == "error":
+            logger.warning("Failed to hash %s: %s", result.task.path_display, result.error)
+        elif result.status == "changed":
+            logger.warning("Skipped changing file %s: %s", result.task.path_display, result.error)
+
+
+def risk_max(values: Iterable[str]) -> str:
+    return max(values, key=lambda value: RISK_ORDER.get(value, 1), default="medium")
+
+
+def fsync_file(handle: object) -> None:
+    handle.flush()  # type: ignore[attr-defined]
+    os.fsync(handle.fileno())  # type: ignore[attr-defined]
+
+
+def atomic_replace(temp_path: Path, final_path: Path) -> None:
+    os.replace(temp_path, final_path)
+    try:
+        directory_fd = os.open(final_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass
+
+
+def generate_all_hashes_csv(
+    connection: sqlite3.Connection,
+    scan_id: str,
+    temp_path: Path,
+) -> None:
+    with restrictive_umask(), open(
+        temp_path,
+        "w",
+        newline="",
+        encoding="utf-8",
+        errors="backslashreplace",
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            (
+                "scan_id",
+                "root",
+                "path",
+                "path_bytes_hex",
+                "apparent_size_bytes",
+                "allocated_size_bytes",
+                "sparse",
+                "mtime_utc",
+                "ctime_utc",
+                "hash",
+                "sample_hash",
+                "algorithm",
+                "status",
+                "error",
+                "logical_bytes_read",
+                "elapsed_seconds",
+                "device",
+                "inode",
+                "management_class",
+                "classification_confidence",
+                "classification_reason",
+                "cleanup_risk",
+                "reused_from_file_id",
+            )
+        )
+        rows = connection.execute(
+            """
+            SELECT f.*, r.path_display AS root_display
+            FROM files f JOIN roots r ON r.id=f.root_id
+            WHERE f.scan_id=?
+            ORDER BY f.path_display
+            """,
+            (scan_id,),
+        )
+        for row in rows:
+            allocated = row["allocated_bytes"]
+            apparent = row["size_bytes"]
+            sparse = (
+                "yes"
+                if allocated is not None and apparent is not None and allocated < apparent
+                else "no"
+            )
+            writer.writerow(
+                (
+                    scan_id,
+                    row["root_display"],
+                    row["path_display"],
+                    bytes(row["path_raw"]).hex(),
+                    "" if apparent is None else apparent,
+                    "" if allocated is None else allocated,
+                    sparse,
+                    utc_timestamp(row["mtime_ns"]),
+                    utc_timestamp(row["ctime_ns"]),
+                    row["digest"],
+                    row["sample_digest"],
+                    row["algorithm"],
+                    row["status"],
+                    row["error"],
+                    row["bytes_read"],
+                    f"{row['elapsed_seconds']:.6f}",
+                    "" if row["device"] is None else row["device"],
+                    "" if row["inode"] is None else row["inode"],
+                    row["management_class"],
+                    row["classification_confidence"],
+                    row["classification_reason"],
+                    row["cleanup_risk"],
+                    "" if row["reused_from_file_id"] is None else row["reused_from_file_id"],
+                )
+            )
+        fsync_file(handle)
+    os.chmod(temp_path, 0o600)
+
+
 def generate_duplicate_csv(
     connection: sqlite3.Connection,
-    duplicate_csv_path: Path,
+    scan_id: str,
     algorithm: str,
+    empty_policy: str,
+    temp_path: Path,
     logger: logging.Logger,
-    print_duplicates: bool,
-) -> tuple[int, int, int]:
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_files_digest_size ON files(digest, size_bytes)"
-    )
-    connection.commit()
+    log_detail: str,
+) -> dict[str, int]:
+    summary = {
+        "groups": 0,
+        "cleanup_groups": 0,
+        "hardlink_only_groups": 0,
+        "duplicate_paths": 0,
+        "logical_duplicate_bytes": 0,
+        "estimated_reclaimable_min_bytes": 0,
+        "estimated_reclaimable_max_bytes": 0,
+    }
 
-    groups = connection.execute(
-        """
+    status_filter = "('ok','reused')"
+    if empty_policy == "report":
+        status_filter = "('ok','reused','empty_reported')"
+
+    group_sql = f"""
         SELECT digest, size_bytes, COUNT(*) AS path_count,
                COUNT(DISTINCT CAST(device AS TEXT) || ':' || CAST(inode AS TEXT))
                    AS physical_copy_count
         FROM files
-        WHERE status = 'ok'
+        WHERE scan_id=? AND status IN {status_filter} AND digest <> ''
         GROUP BY digest, size_bytes
         HAVING COUNT(*) > 1
         ORDER BY size_bytes DESC, path_count DESC, digest
-        """
-    ).fetchall()
+    """
 
-    total_duplicate_paths = 0
-    total_logical_wasted = 0
-
-    with open(
-        duplicate_csv_path,
+    with restrictive_umask(), open(
+        temp_path,
         "w",
         newline="",
         encoding="utf-8",
@@ -516,343 +1714,568 @@ def generate_duplicate_csv(
         writer.writerow(
             (
                 "duplicate_group",
+                "group_kind",
+                "cleanup_candidate",
                 "algorithm",
                 "hash",
-                "size_bytes",
+                "apparent_size_bytes",
                 "path_count",
                 "physical_copy_count",
-                "logical_wasted_bytes",
+                "logical_duplicate_bytes",
+                "total_unique_allocated_bytes",
+                "estimated_reclaimable_min_bytes",
+                "estimated_reclaimable_max_bytes",
+                "contains_sparse_file",
                 "same_physical_file_only",
+                "group_cleanup_risk",
                 "root",
                 "path",
+                "path_bytes_hex",
+                "allocated_size_bytes",
                 "device",
                 "inode",
                 "mtime_utc",
+                "ctime_utc",
+                "management_class",
+                "classification_confidence",
+                "classification_reason",
+                "cleanup_risk",
             )
         )
 
-        for group_number, (digest, size_bytes, path_count, physical_count) in enumerate(
-            groups, start=1
-        ):
-            logical_wasted = int(size_bytes or 0) * (int(path_count) - 1)
-            total_duplicate_paths += int(path_count)
-            total_logical_wasted += logical_wasted
-            same_physical_only = "yes" if int(physical_count) == 1 else "no"
+        group_cursor = connection.execute(group_sql, (scan_id,))
+        for group_number, group in enumerate(group_cursor, start=1):
+            digest = str(group["digest"])
+            apparent_size = int(group["size_bytes"] or 0)
+            path_count = int(group["path_count"])
+            physical_count = int(group["physical_copy_count"])
+            rows = list(
+                connection.execute(
+                    """
+                    SELECT f.*, r.path_display AS root_display
+                    FROM files f JOIN roots r ON r.id=f.root_id
+                    WHERE f.scan_id=? AND f.digest=? AND f.size_bytes=?
+                      AND f.status IN ('ok','reused','empty_reported')
+                    ORDER BY f.path_display
+                    """,
+                    (scan_id, digest, apparent_size),
+                )
+            )
 
-            if print_duplicates:
+            physical_allocations: dict[tuple[int | None, int | None], int] = {}
+            contains_sparse = False
+            risks: list[str] = []
+            for row in rows:
+                allocated = row["allocated_bytes"]
+                if allocated is not None and allocated < apparent_size:
+                    contains_sparse = True
+                identity = (row["device"], row["inode"])
+                physical_allocations[identity] = max(
+                    physical_allocations.get(identity, 0), int(allocated or 0)
+                )
+                risks.append(str(row["cleanup_risk"]))
+
+            allocations = list(physical_allocations.values())
+            total_allocated = sum(allocations)
+            reclaimable_min = total_allocated - max(allocations, default=0)
+            reclaimable_max = total_allocated - min(allocations, default=0)
+            logical_duplicate = apparent_size * (path_count - 1)
+            hardlink_only = physical_count == 1
+            group_kind = "hardlink_aliases" if hardlink_only else "physical_duplicates"
+            cleanup_candidate = "no" if hardlink_only or apparent_size == 0 else "review"
+            group_risk = risk_max(risks)
+
+            summary["groups"] += 1
+            summary["duplicate_paths"] += path_count
+            summary["logical_duplicate_bytes"] += logical_duplicate
+            if hardlink_only:
+                summary["hardlink_only_groups"] += 1
+            if not hardlink_only:
+                if apparent_size > 0:
+                    summary["cleanup_groups"] += 1
+                summary["estimated_reclaimable_min_bytes"] += reclaimable_min
+                summary["estimated_reclaimable_max_bytes"] += reclaimable_max
+
+            if log_detail in ("verbose", "trace"):
                 logger.info(
-                    "DUPLICATE GROUP %d | size=%s | paths=%d | physical copies=%d | hash=%s",
+                    "Duplicate group %d | kind=%s | size=%s | paths=%d | physical copies=%d | estimated reclaimable=%s..%s | risk=%s | hash=%s",
                     group_number,
-                    human_bytes(int(size_bytes or 0)),
+                    group_kind,
+                    human_bytes(apparent_size),
                     path_count,
                     physical_count,
+                    human_bytes(reclaimable_min),
+                    human_bytes(reclaimable_max),
+                    group_risk,
                     digest,
                 )
 
-            rows = connection.execute(
-                """
-                SELECT root, path, device, inode, mtime_ns
-                FROM files
-                WHERE status = 'ok' AND digest = ? AND size_bytes = ?
-                ORDER BY path
-                """,
-                (digest, size_bytes),
-            )
-            for root, path, device, inode, mtime_ns in rows:
-                if print_duplicates:
-                    logger.info("  %s", path)
+            for row in rows:
+                if log_detail == "trace":
+                    logger.info("  %s", row["path_display"])
                 writer.writerow(
                     (
                         group_number,
+                        group_kind,
+                        cleanup_candidate,
                         algorithm,
                         digest,
-                        size_bytes,
+                        apparent_size,
                         path_count,
                         physical_count,
-                        logical_wasted,
-                        same_physical_only,
-                        root,
-                        path,
-                        device,
-                        inode,
-                        utc_mtime(mtime_ns),
+                        logical_duplicate,
+                        total_allocated,
+                        reclaimable_min,
+                        reclaimable_max,
+                        "yes" if contains_sparse else "no",
+                        "yes" if hardlink_only else "no",
+                        group_risk,
+                        row["root_display"],
+                        row["path_display"],
+                        bytes(row["path_raw"]).hex(),
+                        "" if row["allocated_bytes"] is None else row["allocated_bytes"],
+                        "" if row["device"] is None else row["device"],
+                        "" if row["inode"] is None else row["inode"],
+                        utc_timestamp(row["mtime_ns"]),
+                        utc_timestamp(row["ctime_ns"]),
+                        row["management_class"],
+                        row["classification_confidence"],
+                        row["classification_reason"],
+                        row["cleanup_risk"],
                     )
                 )
-
-    return len(groups), total_duplicate_paths, total_logical_wasted
-
-
-def validate_roots(roots: Sequence[str]) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_root in roots:
-        root = normalize_existing_directory(raw_root)
-        if root not in seen:
-            normalized.append(root)
-            seen.add(root)
-    return normalized
+        fsync_file(handle)
+    os.chmod(temp_path, 0o600)
+    return summary
 
 
-def warn_nested_roots(roots: Sequence[str], logger: logging.Logger) -> None:
-    for index, first in enumerate(roots):
-        for second in roots[index + 1 :]:
-            if is_same_or_child(first, second) or is_same_or_child(second, first):
-                logger.warning(
-                    "Nested scan roots detected (%s and %s). Some files may be scanned twice.",
-                    first,
-                    second,
-                )
+def finalize_database(connection: sqlite3.Connection, scan_id: str) -> None:
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.commit()
+    connection.execute(
+        "UPDATE scans SET state='completed', ended_utc=? WHERE scan_id=?",
+        (utc_now(), scan_id),
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(FULL)")
 
 
-def maybe_print_hash(
-    result: HashResult,
-    algorithm: str,
-    enabled: bool,
-    logger: logging.Logger,
-) -> None:
-    if enabled and result.status == "ok":
-        logger.info("HASH %s %s  %s", algorithm, result.digest, result.path)
-
-
-def process_completed(
-    completed: Iterable[Future[HashResult]],
+def set_scan_state(
     connection: sqlite3.Connection,
-    csv_writer: csv.writer,
-    counters: dict[str, int],
-    logger: logging.Logger,
-    algorithm: str,
-    print_hashes: bool,
+    scan_id: str,
+    state: str,
+    reason: str,
 ) -> None:
-    for future in completed:
-        result = future.result()
-        write_result(connection, csv_writer, result)
-        maybe_print_hash(result, algorithm, print_hashes, logger)
-        counters["examined"] += 1
-        counters["bytes_read"] += result.bytes_read
-        counters[result.status] = counters.get(result.status, 0) + 1
-        if result.status == "error":
-            logger.warning("Failed to hash %s: %s", result.path, result.error)
-        elif result.status == "changed":
-            logger.warning("Skipped changing file %s", result.path)
+    try:
+        connection.execute(
+            """
+            UPDATE scans SET state=?, ended_utc=?, interrupted_reason=?
+            WHERE scan_id=?
+            """,
+            (state, utc_now(), safe_display(reason), scan_id),
+        )
+        connection.commit()
+    except (sqlite3.Error, OSError):
+        pass
 
 
-def run_scan(args: argparse.Namespace) -> int:
+def count_existing_resume_rows(connection: sqlite3.Connection, scan_id: str) -> int:
+    row = connection.execute(
+        "SELECT COUNT(*) AS count FROM files WHERE scan_id=? AND status IN ('ok','empty','empty_ignored','empty_reported','reused')", (scan_id,)
+    ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def install_signal_handlers(cancel_event: threading.Event) -> dict[int, object]:
+    previous: dict[int, object] = {}
+
+    def handler(signum: int, _frame: object) -> None:
+        cancel_event.set()
+        if signum == signal.SIGTERM:
+            raise ScanInterrupted("received SIGTERM")
+        raise KeyboardInterrupt
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, handler)
+    return previous
+
+
+def restore_signal_handlers(previous: dict[int, object]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+def validate_args(args: argparse.Namespace) -> None:
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
     if args.chunk_size_mib < 1:
         raise ValueError("--chunk-size-mib must be at least 1")
     if args.progress_seconds <= 0:
         raise ValueError("--progress-seconds must be greater than 0")
+    if args.file_progress_seconds < 0:
+        raise ValueError("--file-progress-seconds cannot be negative")
     if args.retry_changed < 0:
         raise ValueError("--retry-changed cannot be negative")
+    if args.resume and args.incremental:
+        raise ValueError("--resume and --incremental cannot be used together")
+    if args.ignore_empty:
+        args.empty_files = "ignore"
+    if args.no_print_duplicates and args.log_detail != "summary":
+        args.log_detail = "summary"
 
+
+def run_scan(args: argparse.Namespace) -> int:
+    validate_args(args)
     roots = validate_roots(args.roots)
     output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    secure_output_directory(output_dir)
 
     log_path = output_dir / "scan.log"
-    all_hashes_path = output_dir / "all_file_hashes.csv"
-    duplicate_path = output_dir / "duplicate_files.csv"
-    db_path = output_dir / "hash_index.sqlite3"
+    final_db = output_dir / "hash_index.sqlite3"
+    partial_db = output_dir / "hash_index.sqlite3.partial"
+    all_csv = output_dir / "all_file_hashes.csv"
+    all_csv_partial = output_dir / "all_file_hashes.csv.partial"
+    duplicate_csv = output_dir / "duplicate_files.csv"
+    duplicate_csv_partial = output_dir / "duplicate_files.csv.partial"
 
-    logger = configure_logging(log_path)
-    warn_nested_roots(roots, logger)
-
-    excludes = [os.path.abspath(os.path.expanduser(path)) for path in args.exclude]
+    logger = configure_logging(log_path, args.log_detail)
+    excludes = [normalize_existing_directory(path) if os.path.isdir(os.path.expanduser(path)) else os.path.realpath(os.path.abspath(os.path.expanduser(path))) for path in args.exclude]
     for automatic in automatic_excludes(roots):
-        if automatic not in excludes:
-            excludes.append(automatic)
+        normalized = os.path.realpath(automatic)
+        if normalized not in excludes:
+            excludes.append(normalized)
+    output_dir_text = str(output_dir)
+    if any(is_same_or_child(output_dir_text, root) for root in roots):
+        excludes.append(output_dir_text)
+    excludes = sorted(set(excludes))
 
-    # Never recursively scan the output directory if it is inside a selected root.
-    output_dir_str = str(output_dir)
-    if any(is_same_or_child(output_dir_str, root) for root in roots):
-        excludes.append(output_dir_str)
+    config = configuration_payload(args, roots, excludes)
+    config_fingerprint = fingerprint(config)
 
-    hasher_factory = make_hasher(args.algorithm)
-    chunk_size = args.chunk_size_mib * 1024 * 1024
-
-    logger.info("Starting %s %s", PROGRAM_NAME, VERSION)
-    logger.info("Roots: %s", ", ".join(roots))
-    logger.info("Algorithm: %s | workers: %d", args.algorithm, args.workers)
-    logger.info("Output directory: %s", output_dir)
-    if excludes:
-        logger.info("Excluded paths: %s", ", ".join(sorted(set(excludes))))
-
-    connection = create_database(db_path)
-    counters: dict[str, int] = {
-        "examined": 0,
-        "bytes_read": 0,
-        "ok": 0,
-        "error": 0,
-        "changed": 0,
-        "ignored_empty": 0,
-    }
-    scan_started = time.monotonic()
-    last_progress = scan_started
-    last_commit = scan_started
+    if args.resume:
+        if not partial_db.exists():
+            raise ValueError(f"No partial database exists at {partial_db}")
+    else:
+        if partial_db.exists():
+            raise ValueError(
+                f"An unfinished scan exists at {partial_db}. Use --resume or move/delete that file."
+            )
+        if args.incremental and final_db.exists():
+            sqlite_backup(final_db, partial_db)
+        else:
+            with restrictive_umask():
+                partial_db.touch(exist_ok=False)
 
     try:
-        with open(
-            all_hashes_path,
-            "w",
-            newline="",
-            encoding="utf-8",
-            errors="backslashreplace",
-        ) as csv_handle:
-            csv_writer = csv.writer(csv_handle)
-            csv_writer.writerow(
-                (
-                    "root",
-                    "path",
-                    "size_bytes",
-                    "mtime_utc",
-                    "hash",
-                    "status",
-                    "error",
-                    "device",
-                    "inode",
+        connection = open_database(partial_db)
+    except Exception:
+        if not args.resume:
+            for candidate in (
+                partial_db,
+                Path(str(partial_db) + "-wal"),
+                Path(str(partial_db) + "-shm"),
+            ):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+        raise
+    scan_id = ""
+    cancel_event = threading.Event()
+    previous_handlers = install_signal_handlers(cancel_event)
+    counters = Counters()
+    counters_lock = threading.Lock()
+    tracker = ProgressTracker()
+    reporter: ProgressReporter | None = None
+    scan_started = time.monotonic()
+    previous_scan_id: str | None = None
+
+    try:
+        if args.resume:
+            scan_id, generation, root_infos = resume_scan(connection, config_fingerprint)
+            existing_records = count_existing_resume_rows(connection, scan_id)
+            logger.info("Resuming scan %s with %d reusable existing records", scan_id, existing_records)
+        else:
+            if args.incremental:
+                previous_scan_id = latest_completed_scan_id(connection, args.algorithm)
+            scan_id, generation, root_infos = initialize_new_scan(
+                connection, args, roots, config_fingerprint
+            )
+
+        logger.info("Starting %s %s | scan_id=%s", PROGRAM_NAME, VERSION, scan_id)
+        logger.info("Roots: %s", ", ".join(info.path_display for info in root_infos))
+        logger.info(
+            "Algorithm=%s | workers=%d | empty_files=%s | cache_policy=%s",
+            args.algorithm,
+            args.workers,
+            args.empty_files,
+            args.cache_policy,
+        )
+        logger.info("Output directory: %s", safe_display(str(output_dir)))
+        if excludes:
+            logger.info("Excluded paths: %s", ", ".join(safe_display(item) for item in excludes))
+        for root in root_infos:
+            logger.info(
+                "Filesystem: root=%s | type=%s | source=%s | mount=%s | uuid=%s",
+                root.path_display,
+                root.filesystem_type,
+                root.mount_source,
+                root.mount_point,
+                root.filesystem_uuid or "unknown",
+            )
+        for parent in root_infos:
+            children = nested_root_excludes(root_infos).get(parent.root_id, ())
+            if children:
+                logger.info(
+                    "Overlapping-root protection: %s will skip child roots: %s",
+                    parent.path_display,
+                    ", ".join(safe_display(child) for child in children),
                 )
-            )
 
-            tasks = walk_files(
-                roots=roots,
-                excludes=tuple(sorted(set(excludes))),
-                one_file_system=args.one_file_system,
-                logger=logger,
-            )
+        hasher_factory = make_hasher(args.algorithm)
+        chunk_size = args.chunk_size_mib * 1024 * 1024
+        reporter = ProgressReporter(
+            tracker=tracker,
+            counters=counters,
+            counters_lock=counters_lock,
+            logger=logger,
+            stop_event=cancel_event,
+            progress_seconds=args.progress_seconds,
+            file_progress_seconds=args.file_progress_seconds,
+            detail=args.log_detail,
+        )
+        reporter.start()
 
-            if args.workers == 1:
-                for task in tasks:
-                    result = hash_one_file(
+        tasks = walk_files(
+            roots=root_infos,
+            excludes=excludes,
+            one_file_system=args.one_file_system,
+            generation=generation,
+            logger=logger,
+            cancel_event=cancel_event,
+        )
+
+        last_commit = time.monotonic()
+        max_pending = (
+            1 if args.workers == 1
+            else max(args.workers * DEFAULT_QUEUE_MULTIPLIER, args.workers)
+        )
+        pending: set[Future[HashResult]] = set()
+
+        with ThreadPoolExecutor(
+            max_workers=args.workers,
+            thread_name_prefix="hashwatchdog-worker",
+        ) as executor:
+            for task in tasks:
+                if cancel_event.is_set():
+                    break
+                with counters_lock:
+                    counters.discovered += 1
+
+                existing = resumable_row(connection, scan_id, task) if args.resume else None
+                if existing is not None:
+                    mark_seen(connection, int(existing["id"]), generation)
+                    with counters_lock:
+                        counters.examined += 1
+                        counters.reused += 1
+                    continue
+
+                same_inode = current_identity_row(connection, scan_id, task)
+                if same_inode is not None:
+                    copy_reused_row(
+                        connection, scan_id, task, same_inode, generation,
+                        not args.no_managed_classification,
+                    )
+                    with counters_lock:
+                        counters.examined += 1
+                        counters.reused += 1
+                    continue
+
+                reused = incremental_row(
+                    connection,
+                    previous_scan_id,
+                    task,
+                    args.algorithm,
+                    args.cache_policy,
+                )
+                if reused is not None:
+                    copy_reused_row(
+                        connection, scan_id, task, reused, generation,
+                        not args.no_managed_classification,
+                    )
+                    with counters_lock:
+                        counters.examined += 1
+                        counters.reused += 1
+                    continue
+
+                pending.add(
+                    executor.submit(
+                        hash_one_file,
                         task,
                         hasher_factory,
                         chunk_size,
                         args.retry_changed,
-                        args.ignore_empty,
+                        args.empty_files,
+                        tracker,
+                        cancel_event,
+                        not args.no_managed_classification,
                     )
-                    write_result(connection, csv_writer, result)
-                    maybe_print_hash(
-                        result, args.algorithm, args.print_hashes, logger
+                )
+
+                if len(pending) >= max_pending:
+                    completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    process_results(
+                        completed,
+                        connection,
+                        scan_id,
+                        args.algorithm,
+                        counters,
+                        counters_lock,
+                        logger,
+                        args.print_hashes,
                     )
-                    counters["examined"] += 1
-                    counters["bytes_read"] += result.bytes_read
-                    counters[result.status] = counters.get(result.status, 0) + 1
-                    if result.status == "error":
-                        logger.warning("Failed to hash %s: %s", result.path, result.error)
-                    elif result.status == "changed":
-                        logger.warning("Skipped changing file %s", result.path)
 
-                    now = time.monotonic()
-                    if now - last_progress >= args.progress_seconds:
-                        elapsed = max(now - scan_started, 0.001)
-                        logger.info(
-                            "Progress: %d files | %s read | %s/s",
-                            counters["examined"],
-                            human_bytes(counters["bytes_read"]),
-                            human_bytes(counters["bytes_read"] / elapsed),
-                        )
-                        last_progress = now
-                    if now - last_commit >= 2.0:
-                        connection.commit()
-                        csv_handle.flush()
-                        last_commit = now
-            else:
-                max_pending = max(args.workers * DEFAULT_QUEUE_MULTIPLIER, args.workers)
-                pending: set[Future[HashResult]] = set()
-                with ThreadPoolExecutor(
-                    max_workers=args.workers,
-                    thread_name_prefix="hasher",
-                ) as executor:
-                    for task in tasks:
-                        pending.add(
-                            executor.submit(
-                                hash_one_file,
-                                task,
-                                hasher_factory,
-                                chunk_size,
-                                args.retry_changed,
-                                args.ignore_empty,
-                            )
-                        )
-                        if len(pending) >= max_pending:
-                            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
-                            process_completed(
-                                completed,
-                                connection,
-                                csv_writer,
-                                counters,
-                                logger,
-                                args.algorithm,
-                                args.print_hashes,
-                            )
+                now = time.monotonic()
+                if now - last_commit >= COMMIT_SECONDS:
+                    connection.commit()
+                    last_commit = now
 
-                        now = time.monotonic()
-                        if now - last_progress >= args.progress_seconds:
-                            elapsed = max(now - scan_started, 0.001)
-                            logger.info(
-                                "Progress: %d files | %s read | %s/s",
-                                counters["examined"],
-                                human_bytes(counters["bytes_read"]),
-                                human_bytes(counters["bytes_read"] / elapsed),
-                            )
-                            last_progress = now
-                        if now - last_commit >= 2.0:
-                            connection.commit()
-                            csv_handle.flush()
-                            last_commit = now
+            if cancel_event.is_set():
+                for future in pending:
+                    future.cancel()
+            while pending:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                process_results(
+                    completed,
+                    connection,
+                    scan_id,
+                    args.algorithm,
+                    counters,
+                    counters_lock,
+                    logger,
+                    args.print_hashes,
+                )
 
-                    while pending:
-                        completed, pending = wait(pending, return_when=FIRST_COMPLETED)
-                        process_completed(
-                            completed,
-                            connection,
-                            csv_writer,
-                            counters,
-                            logger,
-                            args.algorithm,
-                            args.print_hashes,
-                        )
+        if cancel_event.is_set():
+            raise ScanInterrupted("scan cancellation requested")
 
-            connection.commit()
-            csv_handle.flush()
-
-        logger.info("Hashing complete; building duplicate report")
-        group_count, duplicate_paths, logical_wasted = generate_duplicate_csv(
-            connection,
-            duplicate_path,
-            args.algorithm,
-            logger,
-            args.print_duplicates,
+        # Remove stale rows from a prior resume generation. Paths not encountered in
+        # the current walk were deleted, moved, or newly excluded.
+        connection.execute(
+            "DELETE FROM files WHERE scan_id=? AND seen_generation<>?",
+            (scan_id, generation),
         )
+        connection.commit()
+
+        logger.info("Hashing complete; generating atomic reports")
+        generate_all_hashes_csv(connection, scan_id, all_csv_partial)
+        duplicate_summary = generate_duplicate_csv(
+            connection=connection,
+            scan_id=scan_id,
+            algorithm=args.algorithm,
+            empty_policy=args.empty_files,
+            temp_path=duplicate_csv_partial,
+            logger=logger,
+            log_detail=args.log_detail,
+        )
+        finalize_database(connection, scan_id)
+        connection.close()
+        connection = None  # type: ignore[assignment]
+
+        # The SQLite database is canonical. Promote it first; if a later CSV
+        # promotion is interrupted, reports can be regenerated from the complete DB.
+        atomic_replace(partial_db, final_db)
+        atomic_replace(all_csv_partial, all_csv)
+        atomic_replace(duplicate_csv_partial, duplicate_csv)
 
         elapsed = max(time.monotonic() - scan_started, 0.001)
+        logical_read, _tracker_elapsed, _active = tracker.snapshot()
+        with counters_lock:
+            final_counts = Counters(
+                discovered=counters.discovered,
+                examined=counters.examined,
+                hashed=counters.hashed,
+                reused=counters.reused,
+                errors=counters.errors,
+                changed=counters.changed,
+                cancelled=counters.cancelled,
+                empty=counters.empty,
+            )
         logger.info(
-            "Finished: %d files examined; %d hashed; %d errors; %d changed; %d empty ignored",
-            counters["examined"],
-            counters.get("ok", 0),
-            counters.get("error", 0),
-            counters.get("changed", 0),
-            counters.get("ignored_empty", 0),
+            "Finished: %d discovered | %d examined | %d newly hashed | %d reused | %d errors | %d changed | %d empty",
+            final_counts.discovered,
+            final_counts.examined,
+            final_counts.hashed,
+            final_counts.reused,
+            final_counts.errors,
+            final_counts.changed,
+            final_counts.empty,
         )
         logger.info(
-            "Read %s in %.1f seconds (average %s/s)",
-            human_bytes(counters["bytes_read"]),
+            "Processed %s logical bytes in %.1f seconds (average %s/s)",
+            human_bytes(logical_read),
             elapsed,
-            human_bytes(counters["bytes_read"] / elapsed),
+            human_bytes(logical_read / elapsed),
         )
         logger.info(
-            "Duplicate groups: %d | duplicate paths: %d | logical duplicate bytes: %s",
-            group_count,
-            duplicate_paths,
-            human_bytes(logical_wasted),
+            "Duplicate groups=%d | cleanup review groups=%d | hard-link-only groups=%d | duplicate paths=%d",
+            duplicate_summary["groups"],
+            duplicate_summary["cleanup_groups"],
+            duplicate_summary["hardlink_only_groups"],
+            duplicate_summary["duplicate_paths"],
         )
-        logger.info("All hashes: %s", all_hashes_path)
-        logger.info("Duplicates: %s", duplicate_path)
-        logger.info("Log: %s", log_path)
-        logger.info("SQLite index: %s", db_path)
+        logger.info(
+            "Logical duplicate bytes=%s | estimated physically reclaimable=%s..%s",
+            human_bytes(duplicate_summary["logical_duplicate_bytes"]),
+            human_bytes(duplicate_summary["estimated_reclaimable_min_bytes"]),
+            human_bytes(duplicate_summary["estimated_reclaimable_max_bytes"]),
+        )
+        logger.info("All hashes: %s", safe_display(str(all_csv)))
+        logger.info("Duplicates: %s", safe_display(str(duplicate_csv)))
+        logger.info("SQLite database: %s", safe_display(str(final_db)))
+        logger.info("Log: %s", safe_display(str(log_path)))
         return 0
+
+    except (KeyboardInterrupt, ScanInterrupted) as exc:
+        cancel_event.set()
+        reason = "interrupted by user" if isinstance(exc, KeyboardInterrupt) else str(exc)
+        if scan_id and connection is not None:
+            set_scan_state(connection, scan_id, "interrupted", reason)
+        logger.warning(
+            "Scan interrupted. Resumable state remains at %s. Re-run with --resume and the same options.",
+            safe_display(str(partial_db)),
+        )
+        return 130
+    except (sqlite3.Error, OSError) as exc:
+        cancel_event.set()
+        state = "failed"
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            state = "disk_full"
+        if scan_id and connection is not None:
+            set_scan_state(connection, scan_id, state, f"{type(exc).__name__}: {exc}")
+        logger.error("Scan failed: %s: %s", type(exc).__name__, safe_display(str(exc)))
+        logger.error("Partial database retained at %s", safe_display(str(partial_db)))
+        return 1
     finally:
-        connection.close()
+        cancel_event.set()
+        if reporter is not None:
+            reporter.join(timeout=2.0)
+        if connection is not None:
+            try:
+                connection.commit()
+            except sqlite3.Error:
+                pass
+            connection.close()
+        restore_signal_handlers(previous_handlers)
+        for temp_path in (all_csv_partial, duplicate_csv_partial):
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
 
 def main() -> int:
@@ -860,11 +2283,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return run_scan(args)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.", file=sys.stderr)
-        return 130
     except (ValueError, RuntimeError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error: {safe_display(str(exc))}", file=sys.stderr)
         return 2
 
 
