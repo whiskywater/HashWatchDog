@@ -36,13 +36,18 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
 PROGRAM_NAME = "hashwatchdog"
-VERSION = "2.2.0"
-SCHEMA_VERSION = 2
+VERSION = "3.0.0"
+SCHEMA_VERSION = 3
 DEFAULT_CHUNK_MIB = 8
 DEFAULT_PROGRESS_SECONDS = 5.0
 DEFAULT_FILE_PROGRESS_SECONDS = 10.0
 DEFAULT_QUEUE_MULTIPLIER = 4
 COMMIT_SECONDS = 30.0
+DEFAULT_PATH_WARNING_CHARS = 200
+DEFAULT_OFFICE_PATH_LIMIT = 240
+DEFAULT_HARD_PATH_LIMIT = 259
+DEFAULT_FILENAME_LIMIT = 100
+DEFAULT_DIRECTORY_NAME_LIMIT = 100
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
@@ -119,6 +124,27 @@ class Counters:
     changed: int = 0
     cancelled: int = 0
     empty: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class PathAuditPolicy:
+    warning_path_chars: int
+    office_path_limit: int
+    hard_path_limit: int
+    filename_limit: int
+    directory_name_limit: int
+    windows_prefix_length: int
+
+
+@dataclass(slots=True)
+class PathAuditCounters:
+    examined: int = 0
+    files: int = 0
+    directories: int = 0
+    findings: int = 0
+    warnings: int = 0
+    high: int = 0
+    critical: int = 0
 
 
 class ProgressTracker:
@@ -384,6 +410,86 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable managed-path and cleanup-risk classification heuristics.",
     )
+    path_group = parser.add_argument_group(
+        "Office and OneDrive path-length auditing"
+    )
+    path_group.add_argument(
+        "--audit-paths",
+        action="store_true",
+        help=(
+            "Audit files and directories for Office/OneDrive path-length risks "
+            "while performing the normal duplicate scan."
+        ),
+    )
+    path_group.add_argument(
+        "--path-audit-only",
+        action="store_true",
+        help=(
+            "Audit path lengths without reading or hashing file contents. "
+            "Implies --audit-paths."
+        ),
+    )
+    path_group.add_argument(
+        "--path-warning-chars",
+        type=int,
+        default=DEFAULT_PATH_WARNING_CHARS,
+        metavar="N",
+        help=(
+            "Projected Windows path length that becomes a warning "
+            "(default: %(default)s UTF-16 characters)."
+        ),
+    )
+    path_group.add_argument(
+        "--office-path-limit",
+        type=int,
+        default=DEFAULT_OFFICE_PATH_LIMIT,
+        metavar="N",
+        help=(
+            "Projected Windows path length that becomes high risk "
+            "(default: %(default)s UTF-16 characters)."
+        ),
+    )
+    path_group.add_argument(
+        "--hard-path-limit",
+        type=int,
+        default=DEFAULT_HARD_PATH_LIMIT,
+        metavar="N",
+        help=(
+            "Maximum Office path length; paths longer than this are critical "
+            "(default: %(default)s UTF-16 characters)."
+        ),
+    )
+    path_group.add_argument(
+        "--filename-limit",
+        type=int,
+        default=DEFAULT_FILENAME_LIMIT,
+        metavar="N",
+        help=(
+            "Organization policy limit for an individual filename "
+            "(default: %(default)s UTF-16 characters)."
+        ),
+    )
+    path_group.add_argument(
+        "--directory-name-limit",
+        type=int,
+        default=DEFAULT_DIRECTORY_NAME_LIMIT,
+        metavar="N",
+        help=(
+            "Organization policy limit for an individual directory name "
+            "(default: %(default)s UTF-16 characters)."
+        ),
+    )
+    path_group.add_argument(
+        "--windows-prefix-length",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Characters occupied by the Windows sync root, including its trailing "
+            "backslash. When nonzero, projected length is this value plus the "
+            "root-relative path; 0 audits the scanned path as-is (default: %(default)s)."
+        ),
+    )
     parser.add_argument(
         "--ignore-empty",
         action="store_true",
@@ -439,6 +545,228 @@ def human_bytes(value: float | int) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024.0
     return f"{size:.2f} PiB"
+
+
+def utf16_char_count(value: str) -> int:
+    """Count Windows UTF-16 code units rather than Python Unicode code points."""
+    return len(value.encode("utf-16-le", "surrogatepass")) // 2
+
+
+class PathAuditor:
+    """Persist path-policy violations encountered by the filesystem walker."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        scan_id: str,
+        generation: int,
+        policy: PathAuditPolicy,
+        logger: logging.Logger,
+        progress_seconds: float,
+    ) -> None:
+        self.connection = connection
+        self.scan_id = scan_id
+        self.generation = generation
+        self.policy = policy
+        self.logger = logger
+        self.progress_seconds = progress_seconds
+        self.counters = PathAuditCounters()
+        self._last_progress = time.monotonic()
+
+    def record(self, root: RootInfo, path: str, item_type: str) -> None:
+        try:
+            relative_native = os.path.relpath(path, root.path)
+        except ValueError:
+            relative_native = path
+        if relative_native == ".":
+            relative_native = ""
+
+        relative_windows = relative_native.replace(os.sep, "\\")
+        scanned_windows = path.replace(os.sep, "\\")
+        actual_path_chars = utf16_char_count(scanned_windows)
+        relative_path_chars = utf16_char_count(relative_windows)
+        projected_path_chars = (
+            self.policy.windows_prefix_length + relative_path_chars
+            if self.policy.windows_prefix_length > 0
+            else actual_path_chars
+        )
+
+        components = [piece for piece in relative_native.split(os.sep) if piece]
+        name = components[-1] if components else os.path.basename(path)
+        name_chars = utf16_char_count(name)
+        directory_components = components if item_type == "directory" else components[:-1]
+        directory_lengths = [utf16_char_count(piece) for piece in directory_components]
+        longest_directory_chars = max(directory_lengths, default=0)
+        longest_directory_name = ""
+        if directory_lengths:
+            longest_index = max(range(len(directory_lengths)), key=directory_lengths.__getitem__)
+            longest_directory_name = directory_components[longest_index]
+
+        issues: list[str] = []
+        severity = "none"
+        if projected_path_chars > self.policy.hard_path_limit:
+            issues.append("hard_path_limit_exceeded")
+            severity = "critical"
+        elif projected_path_chars >= self.policy.office_path_limit:
+            issues.append("office_path_risk")
+            severity = "high"
+        elif projected_path_chars >= self.policy.warning_path_chars:
+            issues.append("path_length_warning")
+            severity = "warning"
+
+        if item_type == "file" and name_chars > self.policy.filename_limit:
+            issues.append("filename_limit_exceeded")
+            if severity == "none":
+                severity = "warning"
+        if longest_directory_chars > self.policy.directory_name_limit:
+            issues.append("directory_name_limit_exceeded")
+            if severity == "none":
+                severity = "warning"
+
+        if name_chars > 255 or longest_directory_chars > 255:
+            issues.append("filesystem_component_limit_exceeded")
+            severity = "critical"
+
+        path_bytes = sqlite3.Binary(raw_path(path))
+        if not issues:
+            self.connection.execute(
+                "DELETE FROM path_issues WHERE scan_id=? AND path_raw=?",
+                (self.scan_id, path_bytes),
+            )
+        else:
+            if projected_path_chars >= self.policy.warning_path_chars:
+                shorten_by = projected_path_chars - self.policy.warning_path_chars + 1
+                recommendation = (
+                    f"Shorten the filename or folder hierarchy by at least "
+                    f"{shorten_by} UTF-16 character(s) to return below the warning threshold."
+                )
+            elif "filename_limit_exceeded" in issues:
+                shorten_by = name_chars - self.policy.filename_limit
+                recommendation = (
+                    f"Shorten the filename by at least {shorten_by} UTF-16 character(s)."
+                )
+            else:
+                shorten_by = longest_directory_chars - self.policy.directory_name_limit
+                recommendation = (
+                    f"Shorten the longest directory name by at least "
+                    f"{shorten_by} UTF-16 character(s)."
+                )
+
+            self.connection.execute(
+                """
+                INSERT INTO path_issues(
+                    scan_id, root_id, path_display, path_raw, item_type,
+                    relative_path_display, actual_path_chars, relative_path_chars,
+                    projected_path_chars, name_chars, longest_directory_name,
+                    longest_directory_chars, warning_path_chars, office_path_limit,
+                    hard_path_limit, filename_limit, directory_name_limit,
+                    windows_prefix_length, severity, issue_codes, recommendation,
+                    seen_generation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scan_id, path_raw) DO UPDATE SET
+                    root_id=excluded.root_id,
+                    path_display=excluded.path_display,
+                    item_type=excluded.item_type,
+                    relative_path_display=excluded.relative_path_display,
+                    actual_path_chars=excluded.actual_path_chars,
+                    relative_path_chars=excluded.relative_path_chars,
+                    projected_path_chars=excluded.projected_path_chars,
+                    name_chars=excluded.name_chars,
+                    longest_directory_name=excluded.longest_directory_name,
+                    longest_directory_chars=excluded.longest_directory_chars,
+                    warning_path_chars=excluded.warning_path_chars,
+                    office_path_limit=excluded.office_path_limit,
+                    hard_path_limit=excluded.hard_path_limit,
+                    filename_limit=excluded.filename_limit,
+                    directory_name_limit=excluded.directory_name_limit,
+                    windows_prefix_length=excluded.windows_prefix_length,
+                    severity=excluded.severity,
+                    issue_codes=excluded.issue_codes,
+                    recommendation=excluded.recommendation,
+                    seen_generation=excluded.seen_generation
+                """,
+                (
+                    self.scan_id,
+                    root.root_id,
+                    safe_display(path),
+                    path_bytes,
+                    item_type,
+                    safe_display(relative_windows),
+                    actual_path_chars,
+                    relative_path_chars,
+                    projected_path_chars,
+                    name_chars,
+                    safe_display(longest_directory_name),
+                    longest_directory_chars,
+                    self.policy.warning_path_chars,
+                    self.policy.office_path_limit,
+                    self.policy.hard_path_limit,
+                    self.policy.filename_limit,
+                    self.policy.directory_name_limit,
+                    self.policy.windows_prefix_length,
+                    severity,
+                    ";".join(issues),
+                    recommendation,
+                    self.generation,
+                ),
+            )
+
+        self.counters.examined += 1
+        if item_type == "file":
+            self.counters.files += 1
+        else:
+            self.counters.directories += 1
+        if issues:
+            self.counters.findings += 1
+            if severity == "critical":
+                self.counters.critical += 1
+            elif severity == "high":
+                self.counters.high += 1
+            else:
+                self.counters.warnings += 1
+
+        now = time.monotonic()
+        if now - self._last_progress >= self.progress_seconds:
+            self.logger.info(
+                "Path audit progress: %d items | %d findings | %d critical | %d high | %d warnings",
+                self.counters.examined,
+                self.counters.findings,
+                self.counters.critical,
+                self.counters.high,
+                self.counters.warnings,
+            )
+            self._last_progress = now
+
+    def finish(self) -> PathAuditCounters:
+        self.connection.execute(
+            "DELETE FROM path_issues WHERE scan_id=? AND seen_generation<>?",
+            (self.scan_id, self.generation),
+        )
+        self.connection.execute(
+            """
+            UPDATE scans SET
+                path_audit_examined=?,
+                path_audit_files=?,
+                path_audit_directories=?,
+                path_audit_findings=?,
+                path_audit_warnings=?,
+                path_audit_high=?,
+                path_audit_critical=?
+            WHERE scan_id=?
+            """,
+            (
+                self.counters.examined,
+                self.counters.files,
+                self.counters.directories,
+                self.counters.findings,
+                self.counters.warnings,
+                self.counters.high,
+                self.counters.critical,
+                self.scan_id,
+            ),
+        )
+        self.connection.commit()
+        return self.counters
 
 
 def allocated_bytes_from_stat(info: os.stat_result) -> int | None:
@@ -580,6 +908,8 @@ def mount_details(path: str, info: os.stat_result) -> tuple[str, str, str, str]:
 def configure_logging(log_path: Path, detail: str) -> logging.Logger:
     logger = logging.getLogger(PROGRAM_NAME)
     logger.setLevel(logging.DEBUG if detail == "trace" else logging.INFO)
+    for handler in logger.handlers:
+        handler.close()
     logger.handlers.clear()
     logger.propagate = False
 
@@ -652,7 +982,22 @@ def create_schema(connection: sqlite3.Connection) -> None:
             config_fingerprint TEXT NOT NULL,
             invocation_json TEXT NOT NULL,
             generation INTEGER NOT NULL DEFAULT 1,
-            interrupted_reason TEXT NOT NULL DEFAULT ''
+            interrupted_reason TEXT NOT NULL DEFAULT '',
+            path_audit_enabled INTEGER NOT NULL DEFAULT 0,
+            path_audit_only INTEGER NOT NULL DEFAULT 0,
+            path_warning_chars INTEGER NOT NULL DEFAULT 200,
+            office_path_limit INTEGER NOT NULL DEFAULT 240,
+            hard_path_limit INTEGER NOT NULL DEFAULT 259,
+            filename_limit INTEGER NOT NULL DEFAULT 100,
+            directory_name_limit INTEGER NOT NULL DEFAULT 100,
+            windows_prefix_length INTEGER NOT NULL DEFAULT 0,
+            path_audit_examined INTEGER NOT NULL DEFAULT 0,
+            path_audit_files INTEGER NOT NULL DEFAULT 0,
+            path_audit_directories INTEGER NOT NULL DEFAULT 0,
+            path_audit_findings INTEGER NOT NULL DEFAULT 0,
+            path_audit_warnings INTEGER NOT NULL DEFAULT 0,
+            path_audit_high INTEGER NOT NULL DEFAULT 0,
+            path_audit_critical INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS roots (
@@ -697,6 +1042,33 @@ def create_schema(connection: sqlite3.Connection) -> None:
             UNIQUE(scan_id, path_raw)
         );
 
+        CREATE TABLE IF NOT EXISTS path_issues (
+            id INTEGER PRIMARY KEY,
+            scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
+            root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+            path_display TEXT NOT NULL,
+            path_raw BLOB NOT NULL,
+            item_type TEXT NOT NULL,
+            relative_path_display TEXT NOT NULL,
+            actual_path_chars INTEGER NOT NULL,
+            relative_path_chars INTEGER NOT NULL,
+            projected_path_chars INTEGER NOT NULL,
+            name_chars INTEGER NOT NULL,
+            longest_directory_name TEXT NOT NULL,
+            longest_directory_chars INTEGER NOT NULL,
+            warning_path_chars INTEGER NOT NULL,
+            office_path_limit INTEGER NOT NULL,
+            hard_path_limit INTEGER NOT NULL,
+            filename_limit INTEGER NOT NULL,
+            directory_name_limit INTEGER NOT NULL,
+            windows_prefix_length INTEGER NOT NULL,
+            severity TEXT NOT NULL,
+            issue_codes TEXT NOT NULL,
+            recommendation TEXT NOT NULL,
+            seen_generation INTEGER NOT NULL,
+            UNIQUE(scan_id, path_raw)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_files_scan_digest_size
             ON files(scan_id, status, digest, size_bytes);
         CREATE INDEX IF NOT EXISTS idx_files_scan_device_inode
@@ -705,6 +1077,10 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON files(scan_id, path_display);
         CREATE INDEX IF NOT EXISTS idx_files_reuse_lookup
             ON files(path_raw, algorithm, size_bytes, mtime_ns, ctime_ns, device, inode, status);
+        CREATE INDEX IF NOT EXISTS idx_path_issues_scan_severity
+            ON path_issues(scan_id, severity, projected_path_chars);
+        CREATE INDEX IF NOT EXISTS idx_path_issues_scan_path
+            ON path_issues(scan_id, path_display);
         CREATE INDEX IF NOT EXISTS idx_scans_state_started
             ON scans(state, started_utc);
         """
@@ -712,6 +1088,27 @@ def create_schema(connection: sqlite3.Connection) -> None:
     current_columns = {row[1] for row in connection.execute("PRAGMA table_info(files)")}
     if "sample_digest" not in current_columns:
         connection.execute("ALTER TABLE files ADD COLUMN sample_digest TEXT NOT NULL DEFAULT ''")
+    scan_columns = {row[1] for row in connection.execute("PRAGMA table_info(scans)")}
+    scan_column_migrations = {
+        "path_audit_enabled": "INTEGER NOT NULL DEFAULT 0",
+        "path_audit_only": "INTEGER NOT NULL DEFAULT 0",
+        "path_warning_chars": "INTEGER NOT NULL DEFAULT 200",
+        "office_path_limit": "INTEGER NOT NULL DEFAULT 240",
+        "hard_path_limit": "INTEGER NOT NULL DEFAULT 259",
+        "filename_limit": "INTEGER NOT NULL DEFAULT 100",
+        "directory_name_limit": "INTEGER NOT NULL DEFAULT 100",
+        "windows_prefix_length": "INTEGER NOT NULL DEFAULT 0",
+        "path_audit_examined": "INTEGER NOT NULL DEFAULT 0",
+        "path_audit_files": "INTEGER NOT NULL DEFAULT 0",
+        "path_audit_directories": "INTEGER NOT NULL DEFAULT 0",
+        "path_audit_findings": "INTEGER NOT NULL DEFAULT 0",
+        "path_audit_warnings": "INTEGER NOT NULL DEFAULT 0",
+        "path_audit_high": "INTEGER NOT NULL DEFAULT 0",
+        "path_audit_critical": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, declaration in scan_column_migrations.items():
+        if column not in scan_columns:
+            connection.execute(f"ALTER TABLE scans ADD COLUMN {column} {declaration}")
     connection.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -752,6 +1149,32 @@ def configuration_payload(args: argparse.Namespace, roots: Sequence[str], exclud
         "empty_files": args.empty_files,
         "chunk_size_mib": int(args.chunk_size_mib),
         "managed_classification": not bool(args.no_managed_classification),
+        "path_audit_enabled": bool(args.audit_paths),
+        "path_audit_only": bool(args.path_audit_only),
+        "path_warning_chars": int(args.path_warning_chars),
+        "office_path_limit": int(args.office_path_limit),
+        "hard_path_limit": int(args.hard_path_limit),
+        "filename_limit": int(args.filename_limit),
+        "directory_name_limit": int(args.directory_name_limit),
+        "windows_prefix_length": int(args.windows_prefix_length),
+    }
+
+
+def legacy_configuration_payload(
+    args: argparse.Namespace,
+    roots: Sequence[str],
+    excludes: Sequence[str],
+) -> dict[str, object]:
+    """Build the v2 fingerprint payload for resuming pre-path-audit scans."""
+    return {
+        "roots": [safe_display(root) for root in roots],
+        "roots_raw_hex": [raw_path(root).hex() for root in roots],
+        "excludes_raw_hex": sorted(raw_path(path).hex() for path in excludes),
+        "algorithm": args.algorithm,
+        "one_file_system": bool(args.one_file_system),
+        "empty_files": args.empty_files,
+        "chunk_size_mib": int(args.chunk_size_mib),
+        "managed_classification": not bool(args.no_managed_classification),
     }
 
 
@@ -776,8 +1199,10 @@ def initialize_new_scan(
         INSERT INTO scans(
             scan_id, state, started_utc, hostname, platform, python_version,
             program_version, schema_version, algorithm, config_fingerprint,
-            invocation_json, generation
-        ) VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            invocation_json, generation, path_audit_enabled, path_audit_only,
+            path_warning_chars, office_path_limit, hard_path_limit, filename_limit,
+            directory_name_limit, windows_prefix_length
+        ) VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             scan_id,
@@ -790,6 +1215,14 @@ def initialize_new_scan(
             args.algorithm,
             config_fingerprint,
             json.dumps(invocation, ensure_ascii=True),
+            int(args.audit_paths),
+            int(args.path_audit_only),
+            args.path_warning_chars,
+            args.office_path_limit,
+            args.hard_path_limit,
+            args.filename_limit,
+            args.directory_name_limit,
+            args.windows_prefix_length,
         ),
     )
     root_infos: list[RootInfo] = []
@@ -835,6 +1268,7 @@ def initialize_new_scan(
 def resume_scan(
     connection: sqlite3.Connection,
     config_fingerprint: str,
+    legacy_config_fingerprint: str | None = None,
 ) -> tuple[str, int, list[RootInfo]]:
     row = connection.execute(
         """
@@ -845,7 +1279,10 @@ def resume_scan(
     ).fetchone()
     if row is None:
         raise ValueError("No interrupted scan exists in the partial database.")
-    if row["config_fingerprint"] != config_fingerprint:
+    valid_fingerprints = {config_fingerprint}
+    if legacy_config_fingerprint is not None and int(row["schema_version"]) < 3:
+        valid_fingerprints.add(legacy_config_fingerprint)
+    if row["config_fingerprint"] not in valid_fingerprints:
         raise ValueError(
             "The interrupted scan configuration does not match this invocation. "
             "Use the same roots, exclusions, algorithm, filesystem policy, and empty-file policy."
@@ -886,7 +1323,7 @@ def latest_completed_scan_id(connection: sqlite3.Connection, algorithm: str) -> 
     row = connection.execute(
         """
         SELECT scan_id FROM scans
-        WHERE state='completed' AND algorithm=?
+        WHERE state='completed' AND algorithm=? AND path_audit_only=0
         ORDER BY ended_utc DESC LIMIT 1
         """,
         (algorithm,),
@@ -993,6 +1430,7 @@ def walk_files(
     generation: int,
     logger: logging.Logger,
     cancel_event: threading.Event,
+    path_auditor: PathAuditor | None = None,
 ) -> Iterator[FileTask]:
     normalized_excludes = tuple(os.path.realpath(path) for path in excludes)
     nested_excludes = nested_root_excludes(roots)
@@ -1016,12 +1454,16 @@ def walk_files(
                                 continue
                             info = entry.stat(follow_symlinks=False)
                             if stat.S_ISDIR(info.st_mode):
+                                if path_auditor is not None:
+                                    path_auditor.record(root, path, "directory")
                                 if one_file_system and info.st_dev != root.device:
                                     if logger.isEnabledFor(logging.DEBUG):
                                         logger.debug("Skipped mount point: %s", safe_display(path))
                                     continue
                                 stack.append(path)
                             elif stat.S_ISREG(info.st_mode):
+                                if path_auditor is not None:
+                                    path_auditor.record(root, path, "file")
                                 yield FileTask(
                                     root=root,
                                     path=path,
@@ -1589,6 +2031,13 @@ def atomic_replace(temp_path: Path, final_path: Path) -> None:
         pass
 
 
+def remove_stale_report(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 
 @contextlib.contextmanager
 def report_phase(logger: logging.Logger, name: str) -> Iterator[dict[str, float]]:
@@ -1745,6 +2194,115 @@ def generate_all_hashes_csv(
                 if progress_due(processed, last_processed, now, last_logged):
                     logger.info(
                         "Report progress: all-file inventory | %d / %d rows",
+                        processed,
+                        total,
+                    )
+                    last_processed = processed
+                    last_logged = now
+            fsync_file(handle)
+        os.chmod(temp_path, 0o600)
+    return processed, timing["elapsed"]
+
+
+def generate_path_audit_csv(
+    connection: sqlite3.Connection,
+    scan_id: str,
+    temp_path: Path,
+    logger: logging.Logger,
+) -> tuple[int, float]:
+    total_row = connection.execute(
+        "SELECT COUNT(*) AS count FROM path_issues WHERE scan_id=?", (scan_id,)
+    ).fetchone()
+    total = int(total_row["count"] if total_row else 0)
+
+    with report_phase(logger, f"exporting path-length findings ({total} rows)") as timing:
+        with restrictive_umask(), open(
+            temp_path,
+            "w",
+            newline="",
+            encoding="utf-8",
+            errors="backslashreplace",
+        ) as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                (
+                    "scan_id",
+                    "severity",
+                    "issue_codes",
+                    "item_type",
+                    "root",
+                    "relative_windows_path",
+                    "scanned_path",
+                    "path_bytes_hex",
+                    "actual_scanned_path_chars",
+                    "relative_path_chars",
+                    "windows_prefix_length",
+                    "projected_windows_path_chars",
+                    "path_warning_chars",
+                    "office_path_limit",
+                    "hard_path_limit",
+                    "name_chars",
+                    "filename_limit",
+                    "longest_directory_name",
+                    "longest_directory_chars",
+                    "directory_name_limit",
+                    "characters_over_hard_limit",
+                    "recommendation",
+                )
+            )
+            rows = connection.execute(
+                """
+                SELECT p.*, r.path_display AS root_display
+                FROM path_issues AS p
+                JOIN roots AS r ON r.id=p.root_id
+                WHERE p.scan_id=?
+                ORDER BY
+                    CASE p.severity
+                        WHEN 'critical' THEN 0
+                        WHEN 'high' THEN 1
+                        ELSE 2
+                    END,
+                    p.projected_path_chars DESC,
+                    p.path_display,
+                    p.id
+                """,
+                (scan_id,),
+            )
+            processed = 0
+            last_processed = 0
+            last_logged = time.monotonic()
+            for row in rows:
+                writer.writerow(
+                    (
+                        scan_id,
+                        row["severity"],
+                        row["issue_codes"],
+                        row["item_type"],
+                        row["root_display"],
+                        row["relative_path_display"],
+                        row["path_display"],
+                        bytes(row["path_raw"]).hex(),
+                        row["actual_path_chars"],
+                        row["relative_path_chars"],
+                        row["windows_prefix_length"],
+                        row["projected_path_chars"],
+                        row["warning_path_chars"],
+                        row["office_path_limit"],
+                        row["hard_path_limit"],
+                        row["name_chars"],
+                        row["filename_limit"],
+                        row["longest_directory_name"],
+                        row["longest_directory_chars"],
+                        row["directory_name_limit"],
+                        max(row["projected_path_chars"] - row["hard_path_limit"], 0),
+                        row["recommendation"],
+                    )
+                )
+                processed += 1
+                now = time.monotonic()
+                if progress_due(processed, last_processed, now, last_logged):
+                    logger.info(
+                        "Report progress: path-length findings | %d / %d rows",
                         processed,
                         total,
                     )
@@ -2146,6 +2704,8 @@ def restore_signal_handlers(previous: dict[int, object]) -> None:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.path_audit_only:
+        args.audit_paths = True
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
     if args.chunk_size_mib < 1:
@@ -2160,6 +2720,22 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--resume and --incremental cannot be used together")
     if args.report_only and (args.resume or args.incremental):
         raise ValueError("--report-only cannot be combined with --resume or --incremental")
+    if args.path_audit_only and args.report_only:
+        raise ValueError("--path-audit-only cannot be combined with --report-only")
+    if args.path_audit_only and args.incremental:
+        raise ValueError("--path-audit-only cannot be combined with --incremental")
+    if args.windows_prefix_length < 0:
+        raise ValueError("--windows-prefix-length cannot be negative")
+    if args.path_warning_chars < 1:
+        raise ValueError("--path-warning-chars must be at least 1")
+    if args.office_path_limit <= args.path_warning_chars:
+        raise ValueError("--office-path-limit must be greater than --path-warning-chars")
+    if args.hard_path_limit < args.office_path_limit:
+        raise ValueError("--hard-path-limit must be at least --office-path-limit")
+    if args.filename_limit < 1:
+        raise ValueError("--filename-limit must be at least 1")
+    if args.directory_name_limit < 1:
+        raise ValueError("--directory-name-limit must be at least 1")
     if args.ignore_empty:
         args.empty_files = "ignore"
     if args.no_print_duplicates and args.log_detail != "summary":
@@ -2180,12 +2756,13 @@ def select_report_scan(connection: sqlite3.Connection, algorithm: str) -> sqlite
         raise ValueError(
             f"No scan using algorithm {algorithm!r} exists in the selected database."
         )
-    count_row = connection.execute(
-        "SELECT COUNT(*) AS count FROM files WHERE scan_id=?",
-        (row["scan_id"],),
-    ).fetchone()
-    if count_row is None or int(count_row["count"] or 0) == 0:
-        raise ValueError("The selected scan contains no file records to report.")
+    if not bool(row["path_audit_only"]):
+        count_row = connection.execute(
+            "SELECT COUNT(*) AS count FROM files WHERE scan_id=?",
+            (row["scan_id"],),
+        ).fetchone()
+        if count_row is None or int(count_row["count"] or 0) == 0:
+            raise ValueError("The selected scan contains no file records to report.")
     return row
 
 
@@ -2203,6 +2780,8 @@ def run_scan(args: argparse.Namespace) -> int:
     all_csv_partial = output_dir / "all_file_hashes.csv.partial"
     duplicate_csv = output_dir / "duplicate_files.csv"
     duplicate_csv_partial = output_dir / "duplicate_files.csv.partial"
+    path_csv = output_dir / "path_length_violations.csv"
+    path_csv_partial = output_dir / "path_length_violations.csv.partial"
 
     logger = configure_logging(log_path, args.log_detail)
     excludes = [
@@ -2222,6 +2801,11 @@ def run_scan(args: argparse.Namespace) -> int:
 
     config = configuration_payload(args, roots, excludes)
     config_fingerprint = fingerprint(config)
+    legacy_config_fingerprint = (
+        fingerprint(legacy_configuration_payload(args, roots, excludes))
+        if not args.audit_paths
+        else None
+    )
 
     if args.report_only:
         if not partial_db.exists():
@@ -2273,11 +2857,28 @@ def run_scan(args: argparse.Namespace) -> int:
     hashing_elapsed = 0.0
     logical_read = 0
     previous_scan_id: str | None = None
+    audit_enabled = bool(args.audit_paths)
+    audit_only = bool(args.path_audit_only)
+    path_auditor: PathAuditor | None = None
+    path_counts = PathAuditCounters()
+    path_export_rows = 0
+    path_export_seconds = 0.0
 
     try:
         if args.report_only:
             scan_row = select_report_scan(connection, args.algorithm)
             scan_id = str(scan_row["scan_id"])
+            audit_enabled = bool(scan_row["path_audit_enabled"])
+            audit_only = bool(scan_row["path_audit_only"])
+            path_counts = PathAuditCounters(
+                examined=int(scan_row["path_audit_examined"]),
+                files=int(scan_row["path_audit_files"]),
+                directories=int(scan_row["path_audit_directories"]),
+                findings=int(scan_row["path_audit_findings"]),
+                warnings=int(scan_row["path_audit_warnings"]),
+                high=int(scan_row["path_audit_high"]),
+                critical=int(scan_row["path_audit_critical"]),
+            )
             connection.execute(
                 "UPDATE scans SET state='reporting', ended_utc=NULL, interrupted_reason='' WHERE scan_id=?",
                 (scan_id,),
@@ -2290,10 +2891,18 @@ def run_scan(args: argparse.Namespace) -> int:
                 scan_id,
                 scan_row["state"],
             )
-            logger.info("No filesystem walk or hashing will be performed.")
+            logger.info(
+                "No filesystem walk or hashing will be performed | source audit_enabled=%s | source audit_only=%s",
+                audit_enabled,
+                audit_only,
+            )
         else:
             if args.resume:
-                scan_id, generation, root_infos = resume_scan(connection, config_fingerprint)
+                scan_id, generation, root_infos = resume_scan(
+                    connection,
+                    config_fingerprint,
+                    legacy_config_fingerprint,
+                )
                 existing_records = count_existing_resume_rows(connection, scan_id)
                 logger.info(
                     "Resuming scan %s with %d reusable existing records",
@@ -2341,20 +2950,49 @@ def run_scan(args: argparse.Namespace) -> int:
                         ", ".join(safe_display(child) for child in children),
                     )
 
-            hasher_factory = make_hasher(args.algorithm)
-            chunk_size = args.chunk_size_mib * 1024 * 1024
-            reporter = ProgressReporter(
-                tracker=tracker,
-                counters=counters,
-                counters_lock=counters_lock,
-                logger=logger,
-                stop_event=progress_stop_event,
-                progress_seconds=args.progress_seconds,
-                file_progress_seconds=args.file_progress_seconds,
-                detail=args.log_detail,
-            )
-            hashing_started = time.monotonic()
-            reporter.start()
+            if audit_enabled:
+                audit_policy = PathAuditPolicy(
+                    warning_path_chars=args.path_warning_chars,
+                    office_path_limit=args.office_path_limit,
+                    hard_path_limit=args.hard_path_limit,
+                    filename_limit=args.filename_limit,
+                    directory_name_limit=args.directory_name_limit,
+                    windows_prefix_length=args.windows_prefix_length,
+                )
+                path_auditor = PathAuditor(
+                    connection=connection,
+                    scan_id=scan_id,
+                    generation=generation,
+                    policy=audit_policy,
+                    logger=logger,
+                    progress_seconds=args.progress_seconds,
+                )
+                logger.info(
+                    "Path audit enabled | mode=%s | warning=%d | high-risk=%d | critical-above=%d | filename=%d | directory=%d | Windows prefix=%d",
+                    "audit-only" if audit_only else "combined",
+                    audit_policy.warning_path_chars,
+                    audit_policy.office_path_limit,
+                    audit_policy.hard_path_limit,
+                    audit_policy.filename_limit,
+                    audit_policy.directory_name_limit,
+                    audit_policy.windows_prefix_length,
+                )
+
+            if not audit_only:
+                hasher_factory = make_hasher(args.algorithm)
+                chunk_size = args.chunk_size_mib * 1024 * 1024
+                reporter = ProgressReporter(
+                    tracker=tracker,
+                    counters=counters,
+                    counters_lock=counters_lock,
+                    logger=logger,
+                    stop_event=progress_stop_event,
+                    progress_seconds=args.progress_seconds,
+                    file_progress_seconds=args.file_progress_seconds,
+                    detail=args.log_detail,
+                )
+                hashing_started = time.monotonic()
+                reporter.start()
 
             tasks = walk_files(
                 roots=root_infos,
@@ -2363,83 +3001,117 @@ def run_scan(args: argparse.Namespace) -> int:
                 generation=generation,
                 logger=logger,
                 cancel_event=cancel_event,
+                path_auditor=path_auditor,
             )
             last_commit = time.monotonic()
-            max_pending = (
-                1
-                if args.workers == 1
-                else max(args.workers * DEFAULT_QUEUE_MULTIPLIER, args.workers)
-            )
-            pending: set[Future[HashResult]] = set()
 
-            with ThreadPoolExecutor(
-                max_workers=args.workers,
-                thread_name_prefix="hashwatchdog-worker",
-            ) as executor:
+            if audit_only:
                 for task in tasks:
                     if cancel_event.is_set():
                         break
                     with counters_lock:
                         counters.discovered += 1
+                    now = time.monotonic()
+                    if now - last_commit >= COMMIT_SECONDS:
+                        connection.commit()
+                        last_commit = now
+            else:
+                max_pending = (
+                    1
+                    if args.workers == 1
+                    else max(args.workers * DEFAULT_QUEUE_MULTIPLIER, args.workers)
+                )
+                pending: set[Future[HashResult]] = set()
 
-                    existing = resumable_row(connection, scan_id, task) if args.resume else None
-                    if existing is not None:
-                        mark_seen(connection, int(existing["id"]), generation)
+                with ThreadPoolExecutor(
+                    max_workers=args.workers,
+                    thread_name_prefix="hashwatchdog-worker",
+                ) as executor:
+                    for task in tasks:
+                        if cancel_event.is_set():
+                            break
                         with counters_lock:
-                            counters.examined += 1
-                            counters.reused += 1
-                        continue
+                            counters.discovered += 1
 
-                    same_inode = current_identity_row(connection, scan_id, task)
-                    if same_inode is not None:
-                        copy_reused_row(
+                        existing = resumable_row(connection, scan_id, task) if args.resume else None
+                        if existing is not None:
+                            mark_seen(connection, int(existing["id"]), generation)
+                            with counters_lock:
+                                counters.examined += 1
+                                counters.reused += 1
+                            continue
+
+                        same_inode = current_identity_row(connection, scan_id, task)
+                        if same_inode is not None:
+                            copy_reused_row(
+                                connection,
+                                scan_id,
+                                task,
+                                same_inode,
+                                generation,
+                                not args.no_managed_classification,
+                            )
+                            with counters_lock:
+                                counters.examined += 1
+                                counters.reused += 1
+                            continue
+
+                        reused = incremental_row(
                             connection,
-                            scan_id,
+                            previous_scan_id,
                             task,
-                            same_inode,
-                            generation,
-                            not args.no_managed_classification,
+                            args.algorithm,
+                            args.cache_policy,
                         )
-                        with counters_lock:
-                            counters.examined += 1
-                            counters.reused += 1
-                        continue
+                        if reused is not None:
+                            copy_reused_row(
+                                connection,
+                                scan_id,
+                                task,
+                                reused,
+                                generation,
+                                not args.no_managed_classification,
+                            )
+                            with counters_lock:
+                                counters.examined += 1
+                                counters.reused += 1
+                            continue
 
-                    reused = incremental_row(
-                        connection,
-                        previous_scan_id,
-                        task,
-                        args.algorithm,
-                        args.cache_policy,
-                    )
-                    if reused is not None:
-                        copy_reused_row(
-                            connection,
-                            scan_id,
-                            task,
-                            reused,
-                            generation,
-                            not args.no_managed_classification,
+                        pending.add(
+                            executor.submit(
+                                hash_one_file,
+                                task,
+                                hasher_factory,
+                                chunk_size,
+                                args.retry_changed,
+                                args.empty_files,
+                                tracker,
+                                cancel_event,
+                                not args.no_managed_classification,
+                            )
                         )
-                        with counters_lock:
-                            counters.examined += 1
-                            counters.reused += 1
-                        continue
+                        if len(pending) >= max_pending:
+                            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                            process_results(
+                                completed,
+                                connection,
+                                scan_id,
+                                args.algorithm,
+                                counters,
+                                counters_lock,
+                                logger,
+                                args.print_hashes,
+                            )
 
-                    pending.add(
-                        executor.submit(
-                            hash_one_file,
-                            task,
-                            hasher_factory,
-                            chunk_size,
-                            args.retry_changed,
-                            args.empty_files,
-                            tracker,
-                            cancel_event,
-                            not args.no_managed_classification,
-                        )
-                    )
-                    if len(pending) >= max_pending:
+                        now = time.monotonic()
+                        if now - last_commit >= COMMIT_SECONDS:
+                            connection.commit()
+                            last_commit = now
+
+                    if cancel_event.is_set():
+                        for future in pending:
+                            future.cancel()
+                    while pending:
                         completed, pending = wait(pending, return_when=FIRST_COMPLETED)
                         process_results(
                             completed,
@@ -2452,69 +3124,91 @@ def run_scan(args: argparse.Namespace) -> int:
                             args.print_hashes,
                         )
 
-                    now = time.monotonic()
-                    if now - last_commit >= COMMIT_SECONDS:
-                        connection.commit()
-                        last_commit = now
-
-                if cancel_event.is_set():
-                    for future in pending:
-                        future.cancel()
-                while pending:
-                    completed, pending = wait(pending, return_when=FIRST_COMPLETED)
-                    process_results(
-                        completed,
-                        connection,
-                        scan_id,
-                        args.algorithm,
-                        counters,
-                        counters_lock,
-                        logger,
-                        args.print_hashes,
-                    )
-
             if cancel_event.is_set():
                 raise ScanInterrupted("scan cancellation requested")
 
+            if path_auditor is not None:
+                path_counts = path_auditor.finish()
+                logger.info(
+                    "Path audit complete: %d items | %d files | %d directories | %d findings | %d critical | %d high | %d warnings",
+                    path_counts.examined,
+                    path_counts.files,
+                    path_counts.directories,
+                    path_counts.findings,
+                    path_counts.critical,
+                    path_counts.high,
+                    path_counts.warnings,
+                )
+
+            if not audit_only:
+                connection.execute(
+                    "DELETE FROM files WHERE scan_id=? AND seen_generation<>?",
+                    (scan_id, generation),
+                )
             connection.execute(
-                "DELETE FROM files WHERE scan_id=? AND seen_generation<>?",
-                (scan_id, generation),
-            )
-            connection.execute(
-                "UPDATE scans SET state='hashing_complete', interrupted_reason='' WHERE scan_id=?",
-                (scan_id,),
+                "UPDATE scans SET state=?, interrupted_reason='' WHERE scan_id=?",
+                ("path_audit_complete" if audit_only else "hashing_complete", scan_id),
             )
             connection.commit()
 
-            progress_stop_event.set()
-            reporter.join(timeout=5.0)
-            reporter = None
-            hashing_elapsed = max(time.monotonic() - hashing_started, 0.001)
-            logical_read, _tracker_elapsed, _active = tracker.snapshot()
-            logger.info(
-                "Hashing complete: %s read in %.1f seconds (average %s/s)",
-                human_bytes(logical_read),
-                hashing_elapsed,
-                human_bytes(logical_read / hashing_elapsed),
-            )
+            if not audit_only:
+                progress_stop_event.set()
+                if reporter is not None:
+                    reporter.join(timeout=5.0)
+                    reporter = None
+                hashing_elapsed = max(
+                    time.monotonic() - (hashing_started or time.monotonic()),
+                    0.001,
+                )
+                logical_read, _tracker_elapsed, _active = tracker.snapshot()
+                logger.info(
+                    "Hashing complete: %s read in %.1f seconds (average %s/s)",
+                    human_bytes(logical_read),
+                    hashing_elapsed,
+                    human_bytes(logical_read / hashing_elapsed),
+                )
 
         report_started = time.monotonic()
         prepare_seconds = prepare_reporting_database(connection, logger)
-        all_rows, all_export_seconds = generate_all_hashes_csv(
-            connection,
-            scan_id,
-            all_csv_partial,
-            logger,
-        )
-        duplicate_summary, duplicate_timings = generate_duplicate_csv(
-            connection=connection,
-            scan_id=scan_id,
-            algorithm=args.algorithm,
-            empty_policy=args.empty_files,
-            temp_path=duplicate_csv_partial,
-            logger=logger,
-            log_detail=args.log_detail,
-        )
+        all_rows = 0
+        all_export_seconds = 0.0
+        duplicate_summary = {
+            "groups": 0,
+            "cleanup_groups": 0,
+            "hardlink_only_groups": 0,
+            "duplicate_paths": 0,
+            "logical_duplicate_bytes": 0,
+            "estimated_reclaimable_min_bytes": 0,
+            "estimated_reclaimable_max_bytes": 0,
+        }
+        duplicate_timings = {
+            "candidate_materialization_seconds": 0.0,
+            "group_aggregation_seconds": 0.0,
+            "duplicate_export_seconds": 0.0,
+        }
+        if not audit_only:
+            all_rows, all_export_seconds = generate_all_hashes_csv(
+                connection,
+                scan_id,
+                all_csv_partial,
+                logger,
+            )
+            duplicate_summary, duplicate_timings = generate_duplicate_csv(
+                connection=connection,
+                scan_id=scan_id,
+                algorithm=args.algorithm,
+                empty_policy=args.empty_files,
+                temp_path=duplicate_csv_partial,
+                logger=logger,
+                log_detail=args.log_detail,
+            )
+        if audit_enabled:
+            path_export_rows, path_export_seconds = generate_path_audit_csv(
+                connection,
+                scan_id,
+                path_csv_partial,
+                logger,
+            )
         reporting_elapsed = max(time.monotonic() - report_started, 0.001)
 
         finalize_database(connection, scan_id)
@@ -2524,11 +3218,19 @@ def run_scan(args: argparse.Namespace) -> int:
         atomic_replace(partial_db, final_db)
         remove_sqlite_sidecars(partial_db)
         remove_sqlite_sidecars(final_db)
-        atomic_replace(all_csv_partial, all_csv)
-        atomic_replace(duplicate_csv_partial, duplicate_csv)
+        if not audit_only:
+            atomic_replace(all_csv_partial, all_csv)
+            atomic_replace(duplicate_csv_partial, duplicate_csv)
+        else:
+            remove_stale_report(all_csv)
+            remove_stale_report(duplicate_csv)
+        if audit_enabled:
+            atomic_replace(path_csv_partial, path_csv)
+        else:
+            remove_stale_report(path_csv)
 
         total_elapsed = max(time.monotonic() - total_started, 0.001)
-        if not args.report_only:
+        if not args.report_only and not audit_only:
             with counters_lock:
                 final_counts = Counters(
                     discovered=counters.discovered,
@@ -2556,35 +3258,49 @@ def run_scan(args: argparse.Namespace) -> int:
                 hashing_elapsed,
                 human_bytes(logical_read / max(hashing_elapsed, 0.001)),
             )
+        elif audit_only:
+            logger.info("Hashing phase: skipped (path-audit-only mode)")
         else:
             logger.info("Hashing phase: skipped (report-only mode)")
 
         logger.info(
-            "Reporting phase: %.1f seconds | prepare %.2fs | all-file export %.2fs | candidate materialization %.2fs | group aggregation %.2fs | duplicate export %.2fs",
+            "Reporting phase: %.1f seconds | prepare %.2fs | all-file export %.2fs | candidate materialization %.2fs | group aggregation %.2fs | duplicate export %.2fs | path-audit export %.2fs",
             reporting_elapsed,
             prepare_seconds,
             all_export_seconds,
             duplicate_timings["candidate_materialization_seconds"],
             duplicate_timings["group_aggregation_seconds"],
             duplicate_timings["duplicate_export_seconds"],
+            path_export_seconds,
         )
         logger.info("Total runtime: %.1f seconds", total_elapsed)
-        logger.info("All-file rows exported: %d", all_rows)
-        logger.info(
-            "Duplicate groups=%d | cleanup review groups=%d | hard-link-only groups=%d | duplicate paths=%d",
-            duplicate_summary["groups"],
-            duplicate_summary["cleanup_groups"],
-            duplicate_summary["hardlink_only_groups"],
-            duplicate_summary["duplicate_paths"],
-        )
-        logger.info(
-            "Logical duplicate bytes=%s | estimated physically reclaimable=%s..%s",
-            human_bytes(duplicate_summary["logical_duplicate_bytes"]),
-            human_bytes(duplicate_summary["estimated_reclaimable_min_bytes"]),
-            human_bytes(duplicate_summary["estimated_reclaimable_max_bytes"]),
-        )
-        logger.info("All hashes: %s", safe_display(str(all_csv)))
-        logger.info("Duplicates: %s", safe_display(str(duplicate_csv)))
+        if not audit_only:
+            logger.info("All-file rows exported: %d", all_rows)
+            logger.info(
+                "Duplicate groups=%d | cleanup review groups=%d | hard-link-only groups=%d | duplicate paths=%d",
+                duplicate_summary["groups"],
+                duplicate_summary["cleanup_groups"],
+                duplicate_summary["hardlink_only_groups"],
+                duplicate_summary["duplicate_paths"],
+            )
+            logger.info(
+                "Logical duplicate bytes=%s | estimated physically reclaimable=%s..%s",
+                human_bytes(duplicate_summary["logical_duplicate_bytes"]),
+                human_bytes(duplicate_summary["estimated_reclaimable_min_bytes"]),
+                human_bytes(duplicate_summary["estimated_reclaimable_max_bytes"]),
+            )
+            logger.info("All hashes: %s", safe_display(str(all_csv)))
+            logger.info("Duplicates: %s", safe_display(str(duplicate_csv)))
+        if audit_enabled:
+            logger.info(
+                "Path audit: %d items examined | %d findings exported | %d critical | %d high | %d warnings",
+                path_counts.examined,
+                path_export_rows,
+                path_counts.critical,
+                path_counts.high,
+                path_counts.warnings,
+            )
+            logger.info("Path violations: %s", safe_display(str(path_csv)))
         logger.info("SQLite database: %s", safe_display(str(final_db)))
         logger.info("Log: %s", safe_display(str(log_path)))
         return 0
@@ -2625,12 +3341,19 @@ def run_scan(args: argparse.Namespace) -> int:
                 pass
             connection.close()
         restore_signal_handlers(previous_handlers)
-        for temp_path in (all_csv_partial, duplicate_csv_partial):
+        for temp_path in (all_csv_partial, duplicate_csv_partial, path_csv_partial):
             if temp_path.exists():
                 try:
                     temp_path.unlink()
                 except OSError:
                     pass
+        for handler in logger.handlers:
+            try:
+                handler.flush()
+                handler.close()
+            except OSError:
+                pass
+        logger.handlers.clear()
 
 
 def main() -> int:
