@@ -36,8 +36,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
 PROGRAM_NAME = "hashwatchdog"
-VERSION = "3.0.0"
-SCHEMA_VERSION = 3
+VERSION = "3.1.1"
+SCHEMA_VERSION = 4
 DEFAULT_CHUNK_MIB = 8
 DEFAULT_PROGRESS_SECONDS = 5.0
 DEFAULT_FILE_PROGRESS_SECONDS = 10.0
@@ -289,9 +289,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--root",
         dest="roots",
         action="append",
-        required=True,
+        required=False,
         metavar="PATH",
-        help="Root directory to scan. Repeat to compare multiple filesystems.",
+        help="Root directory to scan. Repeat to compare multiple filesystems. Not required for post-scan cleanup.",
     )
     parser.add_argument(
         "--output-dir",
@@ -388,6 +388,101 @@ def build_parser() -> argparse.ArgumentParser:
             "without walking or hashing the filesystem."
         ),
     )
+    cleanup_group = parser.add_argument_group("Post-scan duplicate cleanup")
+    cleanup_group.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Operate on duplicate groups from an existing completed SQLite database without rescanning.",
+    )
+    cleanup_group.add_argument(
+        "--cleanup-action",
+        choices=("interactive", "preview", "manifest", "quarantine", "delete"),
+        default="interactive",
+        help="Cleanup action (default: interactive).",
+    )
+    cleanup_group.add_argument(
+        "--cleanup-risk",
+        choices=("low", "medium", "high", "critical"),
+        default="low",
+        help="Operate only on groups whose aggregate cleanup risk exactly matches this level (default: low).",
+    )
+    cleanup_group.add_argument(
+        "--cleanup-eligibility",
+        choices=("automatic", "all"),
+        default="automatic",
+        help=(
+            "automatic permits only conservative same-folder obvious-copy groups; "
+            "all includes every group at the selected risk and requires manual review "
+            "(default: automatic)."
+        ),
+    )
+    cleanup_group.add_argument(
+        "--cleanup-scan-id",
+        metavar="SCAN_ID",
+        help="Completed scan ID to clean; defaults to the latest completed scan in the database.",
+    )
+    cleanup_group.add_argument(
+        "--cleanup-manifest",
+        metavar="PATH",
+        help="Manifest output path (default: OUTPUT_DIR/cleanup-manifest-<run-id>.csv).",
+    )
+    cleanup_group.add_argument(
+        "--quarantine-dir",
+        metavar="DIR",
+        help="Destination for quarantine mode. Required for --cleanup-action quarantine.",
+    )
+    cleanup_group.add_argument(
+        "--protect",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Never remove files at or beneath this path. Repeatable.",
+    )
+    cleanup_group.add_argument(
+        "--keep-prefer",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Prefer a keeper at or beneath this path. Repeatable and ordered.",
+    )
+    cleanup_group.add_argument(
+        "--delete-prefer",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="Prefer deleting paths matching this case-sensitive glob. Repeatable and ordered.",
+    )
+    cleanup_group.add_argument(
+        "--include-group",
+        action="append",
+        type=int,
+        default=[],
+        metavar="N",
+        help="Limit cleanup to a duplicate group number from duplicate_files.csv ordering. Repeatable.",
+    )
+    cleanup_group.add_argument(
+        "--exclude-group",
+        action="append",
+        type=int,
+        default=[],
+        metavar="N",
+        help="Exclude a duplicate group number. Repeatable.",
+    )
+    cleanup_group.add_argument(
+        "--no-full-verify",
+        action="store_true",
+        help="Use metadata-only validation instead of rehashing each keeper and candidate. Unsafe for deletion.",
+    )
+    cleanup_group.add_argument(
+        "--yes-noninteractive",
+        action="store_true",
+        help="Permit non-interactive preview/manifest/quarantine. Permanent delete still requires a confirmation token.",
+    )
+    cleanup_group.add_argument(
+        "--confirmation-token",
+        help="Non-interactive permanent-delete token. Must exactly equal DELETETHESEFILES.",
+    )
+
     parser.add_argument(
         "--incremental",
         action="store_true",
@@ -1083,6 +1178,43 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON path_issues(scan_id, path_display);
         CREATE INDEX IF NOT EXISTS idx_scans_state_started
             ON scans(state, started_utc);
+
+        CREATE TABLE IF NOT EXISTS cleanup_runs (
+            cleanup_run_id TEXT PRIMARY KEY,
+            scan_id TEXT NOT NULL,
+            started_utc TEXT NOT NULL,
+            ended_utc TEXT,
+            requested_risk TEXT NOT NULL,
+            action TEXT NOT NULL,
+            verification_mode TEXT NOT NULL,
+            state TEXT NOT NULL,
+            proposed_files INTEGER NOT NULL DEFAULT 0,
+            processed_files INTEGER NOT NULL DEFAULT 0,
+            deleted_files INTEGER NOT NULL DEFAULT 0,
+            quarantined_files INTEGER NOT NULL DEFAULT 0,
+            skipped_files INTEGER NOT NULL DEFAULT 0,
+            failed_files INTEGER NOT NULL DEFAULT 0,
+            estimated_bytes INTEGER NOT NULL DEFAULT 0,
+            reclaimed_bytes INTEGER NOT NULL DEFAULT 0,
+            manifest_path TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS cleanup_actions (
+            id INTEGER PRIMARY KEY,
+            cleanup_run_id TEXT NOT NULL REFERENCES cleanup_runs(cleanup_run_id) ON DELETE CASCADE,
+            group_number INTEGER NOT NULL,
+            digest TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            keeper_path TEXT NOT NULL,
+            candidate_path TEXT NOT NULL,
+            candidate_path_raw BLOB NOT NULL,
+            verification_result TEXT NOT NULL,
+            action_result TEXT NOT NULL,
+            destination_path TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT '',
+            acted_utc TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cleanup_actions_run ON cleanup_actions(cleanup_run_id);
         """
     )
     current_columns = {row[1] for row in connection.execute("PRAGMA table_info(files)")}
@@ -2704,6 +2836,20 @@ def restore_signal_handlers(previous: dict[int, object]) -> None:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.cleanup:
+        if args.resume or args.report_only or args.incremental or args.path_audit_only:
+            raise ValueError("--cleanup cannot be combined with scan, resume, report-only, incremental, or path-audit-only modes")
+        if args.roots:
+            raise ValueError("--root is not used with --cleanup; cleanup reads roots from the completed database")
+        if args.cleanup_action == "quarantine" and not args.quarantine_dir:
+            raise ValueError("--quarantine-dir is required for quarantine mode")
+        if args.cleanup_action == "delete" and args.no_full_verify:
+            raise ValueError("Permanent deletion requires full hash verification; remove --no-full-verify")
+        if args.cleanup_risk == "critical" and args.cleanup_action in ("quarantine", "delete"):
+            raise ValueError("Critical-risk automatic cleanup is intentionally disabled")
+        return
+    if not args.roots:
+        raise ValueError("At least one --root is required unless --cleanup is used")
     if args.path_audit_only:
         args.audit_paths = True
     if args.workers < 1:
@@ -2765,6 +2911,295 @@ def select_report_scan(connection: sqlite3.Connection, algorithm: str) -> sqlite
             raise ValueError("The selected scan contains no file records to report.")
     return row
 
+
+
+
+def _path_is_same_or_child(path: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath((os.path.realpath(path), os.path.realpath(parent))) == os.path.realpath(parent)
+    except (ValueError, OSError):
+        return False
+
+
+def _hash_path(path: str, algorithm: str, chunk_size: int = 8 * 1024 * 1024) -> str:
+    hasher = make_hasher(algorithm)()
+    with open(path, "rb", buffering=0) as handle:
+        while True:
+            block = handle.read(chunk_size)
+            if not block:
+                break
+            hasher.update(block)  # type: ignore[attr-defined]
+    return hasher.hexdigest()  # type: ignore[attr-defined]
+
+
+def _copy_suffix_score(path: str) -> int:
+    import re
+    name = os.path.basename(path)
+    return 1 if re.search(r"(?: \(\d+\)|\(\d+\)| copy(?: \d+)?)\.[^.]+$", name, re.IGNORECASE) else 0
+
+
+def _normalized_copy_basename(path: str) -> str:
+    import re
+    name = os.path.basename(path)
+    stem, suffix = os.path.splitext(name)
+    normalized = re.sub(r"(?: \(\d+\)|\(\d+\)| copy(?: \d+)?)$", "", stem, flags=re.IGNORECASE)
+    return (normalized + suffix).casefold()
+
+
+def _automatic_cleanup_clusters(members: Sequence[sqlite3.Row]) -> list[tuple[list[sqlite3.Row], str]]:
+    """Return conservative same-folder copy clusters within a hash group.
+
+    A global duplicate group may span backups or projects while also containing an
+    accidental `file (1).ext` beside `file.ext`. Automatic cleanup therefore works
+    on eligible same-directory/name clusters and leaves all unrelated copies alone.
+    """
+    clusters: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in members:
+        path = os.fsdecode(bytes(row["path_raw"]))
+        key = (os.path.realpath(os.path.dirname(path)), _normalized_copy_basename(path))
+        clusters.setdefault(key, []).append(row)
+    eligible: list[tuple[list[sqlite3.Row], str]] = []
+    blocked_tokens = (
+        "backup", "backups", "archive", "archives", "server", "servers",
+        "world", "worlds", "minecraft", "mods", "libraries", "library",
+        "assets", "cache", "program files", "windows", "appdata", "system32",
+        "steamapps", "node_modules", "venv", ".venv", "site-packages",
+        "git", "project", "projects", "build", "dist", "content",
+        "olddrive", "old drive", "old laptop", "oldlaptop",
+    )
+    for (parent, _normalized), cluster in clusters.items():
+        physical = {(int(row["device"] or -1), int(row["inode"] or -1)) for row in cluster}
+        if len(physical) < 2:
+            continue
+        paths = [os.fsdecode(bytes(row["path_raw"])) for row in cluster]
+        if not any(_copy_suffix_score(path) for path in paths):
+            continue
+        if not any(_copy_suffix_score(path) == 0 for path in paths):
+            continue
+        lowered = parent.casefold()
+        if any(token in lowered for token in blocked_tokens):
+            continue
+        extensions = {os.path.splitext(path)[1].casefold() for path in paths}
+        if len(extensions) != 1:
+            continue
+        eligible.append((cluster, "same-folder-obvious-numbered-copy"))
+    return eligible
+
+
+def _keeper_sort_key(row: sqlite3.Row, protect: Sequence[str], keep_prefer: Sequence[str], delete_prefer: Sequence[str]) -> tuple:
+    path = os.fsdecode(bytes(row["path_raw"]))
+    protected = any(_path_is_same_or_child(path, item) for item in protect)
+    keep_rank = next((idx for idx, item in enumerate(keep_prefer) if _path_is_same_or_child(path, item)), len(keep_prefer))
+    delete_rank = next((idx for idx, pattern in enumerate(delete_prefer) if Path(path).match(pattern)), len(delete_prefer))
+    return (
+        0 if protected else 1,
+        keep_rank,
+        1 if delete_rank < len(delete_prefer) else 0,
+        _copy_suffix_score(path),
+        len(path),
+        path,
+    )
+
+
+def _select_cleanup_scan(connection: sqlite3.Connection, requested_scan_id: str | None) -> sqlite3.Row:
+    if requested_scan_id:
+        row = connection.execute("SELECT * FROM scans WHERE scan_id=?", (requested_scan_id,)).fetchone()
+    else:
+        row = connection.execute("SELECT * FROM scans WHERE state='completed' AND path_audit_only=0 ORDER BY ended_utc DESC, started_utc DESC LIMIT 1").fetchone()
+    if row is None:
+        raise ValueError("No matching completed scan exists in the selected database")
+    if row["state"] != "completed":
+        raise ValueError(f"Cleanup requires a completed scan; selected scan state is {row['state']!r}")
+    return row
+
+
+def _load_cleanup_groups(connection: sqlite3.Connection, scan_id: str, risk: str) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT id, path_display, path_raw, size_bytes, allocated_bytes, mtime_ns, ctime_ns,
+               device, inode, digest, algorithm, cleanup_risk, management_class,
+               classification_confidence, classification_reason
+        FROM files
+        WHERE scan_id=? AND status IN ('ok','reused','empty_reported') AND digest<>''
+        ORDER BY digest, size_bytes, path_display, id
+        """, (scan_id,)
+    ).fetchall()
+    grouped: dict[tuple[str, int], list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault((str(row["digest"]), int(row["size_bytes"] or 0)), []).append(row)
+    result=[]
+    group_number=0
+    for (digest,size), members in sorted(grouped.items(), key=lambda x:(x[0][0],x[0][1])):
+        if len(members)<2:
+            continue
+        physical={(int(r["device"] or -1), int(r["inode"] or -1)) for r in members}
+        if len(physical)<2:
+            continue
+        group_number += 1
+        group_risk=max((str(r["cleanup_risk"]) for r in members), key=lambda x:RISK_ORDER.get(x,3))
+        if group_risk != risk:
+            continue
+        result.append({"group_number":group_number,"digest":digest,"size_bytes":size,"members":members,"risk":group_risk})
+    return result
+
+
+def _metadata_matches(row: sqlite3.Row, path: str) -> tuple[bool, str]:
+    try:
+        st=os.lstat(path)
+    except OSError as exc:
+        return False, f"lstat failed: {exc}"
+    if not stat.S_ISREG(st.st_mode):
+        return False, "path is no longer a regular file"
+    expected=(int(row["size_bytes"] or 0), int(row["mtime_ns"] or 0), int(row["ctime_ns"] or 0), int(row["device"] or 0), int(row["inode"] or 0))
+    actual=(int(st.st_size), int(st.st_mtime_ns), int(st.st_ctime_ns), int(st.st_dev), int(st.st_ino))
+    if expected != actual:
+        return False, f"metadata changed: expected={expected} actual={actual}"
+    return True, "metadata matched"
+
+
+def _write_cleanup_manifest(path: Path, proposals: list[dict[str, object]]) -> None:
+    secure_output_directory(path.parent)
+    temp=Path(str(path)+".partial")
+    with restrictive_umask(), open(temp,"w",newline="",encoding="utf-8") as handle:
+        writer=csv.writer(handle)
+        writer.writerow(("group_number","group_risk","automatic_cleanup_eligible","eligibility_reason","digest","size_bytes","keeper_path","candidate_path","classification_reason"))
+        for proposal in proposals:
+            row=proposal["candidate"]
+            writer.writerow((proposal["group_number"],proposal["risk"],proposal["automatic_cleanup_eligible"],proposal["eligibility_reason"],proposal["digest"],proposal["size_bytes"],proposal["keeper_path"],proposal["candidate_path"],row["classification_reason"]))
+        fsync_file(handle)
+    os.replace(temp,path)
+    os.chmod(path,0o600)
+
+
+def run_cleanup(args: argparse.Namespace) -> int:
+    validate_args(args)
+    output_dir=Path(args.output_dir).expanduser().resolve()
+    final_db=output_dir/"hash_index.sqlite3"
+    if not final_db.exists():
+        raise ValueError(f"No completed database exists at {final_db}")
+    connection=open_database(final_db)
+    create_schema(connection)
+    try:
+        scan=_select_cleanup_scan(connection,args.cleanup_scan_id)
+        groups=_load_cleanup_groups(connection,str(scan["scan_id"]),args.cleanup_risk)
+        included=set(args.include_group)
+        excluded=set(args.exclude_group)
+        protect=[os.path.realpath(os.path.expanduser(p)) for p in args.protect]
+        keep_prefer=[os.path.realpath(os.path.expanduser(p)) for p in args.keep_prefer]
+        proposals=[]
+        for group in groups:
+            number=int(group["group_number"])
+            if included and number not in included or number in excluded:
+                continue
+            members=list(group["members"])
+            if args.cleanup_eligibility == "automatic":
+                cleanup_sets = [(cluster, True, reason) for cluster, reason in _automatic_cleanup_clusters(members)]
+            else:
+                cleanup_sets = [(members, False, "manual-all-risk-group")]
+            for cleanup_members, auto_eligible, eligibility_reason in cleanup_sets:
+                keeper=min(cleanup_members,key=lambda row:_keeper_sort_key(row,protect,keep_prefer,args.delete_prefer))
+                keeper_path=os.fsdecode(bytes(keeper["path_raw"]))
+                keeper_identity=(int(keeper["device"] or -1),int(keeper["inode"] or -1))
+                seen={keeper_identity}
+                for row in cleanup_members:
+                    identity=(int(row["device"] or -1),int(row["inode"] or -1))
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    candidate_path=os.fsdecode(bytes(row["path_raw"]))
+                    if any(_path_is_same_or_child(candidate_path,p) for p in protect):
+                        continue
+                    proposals.append({"group_number":number,"risk":group["risk"],"automatic_cleanup_eligible":auto_eligible,"eligibility_reason":eligibility_reason,"digest":group["digest"],"size_bytes":group["size_bytes"],"keeper":keeper,"keeper_path":keeper_path,"candidate":row,"candidate_path":candidate_path})
+        estimated=sum(int(p["size_bytes"]) for p in proposals)
+        run_id=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")+"-"+uuid.uuid4().hex[:8]
+        manifest=Path(args.cleanup_manifest).expanduser().resolve() if args.cleanup_manifest else output_dir/f"cleanup-manifest-{run_id}.csv"
+        print(f"HashWatchDog cleanup | scan_id={scan['scan_id']} | risk={args.cleanup_risk} | eligibility={args.cleanup_eligibility}")
+        print(f"Eligible groups: {len({p['group_number'] for p in proposals}):,}")
+        print(f"Proposed removals: {len(proposals):,}")
+        print(f"Estimated maximum reclaimable: {human_bytes(estimated)}")
+        print(f"Manifest: {manifest}")
+        if args.cleanup_eligibility == "all":
+            print("WARNING: eligibility=all includes semantically distinct backups, applications, servers, and projects. Review the manifest manually.")
+        action=args.cleanup_action
+        if action=="interactive":
+            print("\nSelect action: [1] preview  [2] manifest  [3] quarantine  [4] permanent delete  [5] exit")
+            choice=input("Selection: ").strip()
+            action={"1":"preview","2":"manifest","3":"quarantine","4":"delete","5":"exit"}.get(choice,"exit")
+        if action=="exit":
+            return 0
+        _write_cleanup_manifest(manifest,proposals)
+        if action in ("preview","manifest"):
+            for p in proposals[:25]:
+                print(f"KEEP   {safe_display(str(p['keeper_path']))}")
+                print(f"REMOVE {safe_display(str(p['candidate_path']))}")
+            if len(proposals)>25:
+                print(f"... {len(proposals)-25:,} more candidates are listed in the manifest")
+            return 0
+        if action=="quarantine" and not args.quarantine_dir:
+            entered=input("Quarantine directory: ").strip()
+            if not entered:
+                raise ValueError("A quarantine directory is required")
+            args.quarantine_dir=entered
+        if action=="delete":
+            if args.cleanup_eligibility != "automatic":
+                raise ValueError("Permanent bulk deletion is limited to --cleanup-eligibility automatic; use group filters or quarantine for broader sets")
+            token=args.confirmation_token
+            if token is None:
+                print("\nWARNING: permanent deletion cannot be undone.")
+                print(f"The tool will fully rehash {len(proposals):,} candidates and retain at least one verified copy per group.")
+                token=input("Type DELETETHESEFILES to continue: ")
+            if token != "DELETETHESEFILES":
+                raise ValueError("Deletion confirmation token did not match; nothing was deleted")
+            if sys.stdin.isatty() and args.confirmation_token is None:
+                count=input(f"Type the exact proposed file count ({len(proposals)}) to confirm: ").strip()
+                if count != str(len(proposals)):
+                    raise ValueError("Deletion count confirmation did not match; nothing was deleted")
+        verification="metadata" if args.no_full_verify else "full"
+        connection.execute("INSERT INTO cleanup_runs(cleanup_run_id,scan_id,started_utc,requested_risk,action,verification_mode,state,proposed_files,estimated_bytes,manifest_path) VALUES(?,?,?,?,?,?,?,?,?,?)",(run_id,scan["scan_id"],datetime.now(timezone.utc).isoformat(),args.cleanup_risk,action,verification,"running",len(proposals),estimated,str(manifest)))
+        connection.commit()
+        processed=deleted=quarantined=skipped=failed=reclaimed=0
+        verified_keepers: dict[tuple[int,str],bool]={}
+        quarantine_root=Path(args.quarantine_dir).expanduser().resolve()/run_id if action=="quarantine" else None
+        if quarantine_root:
+            secure_output_directory(quarantine_root)
+        for p in proposals:
+            result="skipped"; error=""; destination=""; verify_result=""
+            keeper=p["keeper"]; candidate=p["candidate"]
+            kp=str(p["keeper_path"]); cp=str(p["candidate_path"])
+            try:
+                ok,msg=_metadata_matches(keeper,kp)
+                if not ok: raise RuntimeError("keeper "+msg)
+                ok,msg=_metadata_matches(candidate,cp)
+                if not ok: raise RuntimeError("candidate "+msg)
+                if os.path.islink(kp) or os.path.islink(cp): raise RuntimeError("symlink path refused")
+                key=(int(p["group_number"]),kp)
+                if verification=="full":
+                    if key not in verified_keepers:
+                        verified_keepers[key]=_hash_path(kp,str(scan["algorithm"]))==str(p["digest"])
+                    if not verified_keepers[key]: raise RuntimeError("keeper hash no longer matches database")
+                    if _hash_path(cp,str(scan["algorithm"])) != str(p["digest"]): raise RuntimeError("candidate hash no longer matches database")
+                verify_result="verified"
+                if action=="delete":
+                    os.unlink(cp); deleted+=1; result="deleted"; reclaimed+=int(p["size_bytes"])
+                else:
+                    assert quarantine_root is not None
+                    relative=Path(cp.lstrip(os.sep))
+                    dest=quarantine_root/relative
+                    secure_output_directory(dest.parent)
+                    if dest.exists(): dest=dest.with_name(dest.name+"."+uuid.uuid4().hex[:8])
+                    shutil.move(cp,dest); destination=str(dest); quarantined+=1; result="quarantined"; reclaimed+=int(p["size_bytes"])
+            except Exception as exc:
+                error=f"{type(exc).__name__}: {exc}"; skipped+=1; result="skipped"
+            processed+=1
+            connection.execute("INSERT INTO cleanup_actions(cleanup_run_id,group_number,digest,size_bytes,keeper_path,candidate_path,candidate_path_raw,verification_result,action_result,destination_path,error,acted_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(run_id,p["group_number"],p["digest"],p["size_bytes"],kp,cp,sqlite3.Binary(bytes(candidate["path_raw"])),verify_result,result,destination,error,datetime.now(timezone.utc).isoformat()))
+            if processed%100==0: connection.commit(); print(f"Cleanup progress: {processed:,}/{len(proposals):,}")
+        state="completed" if failed==0 else "completed_with_errors"
+        connection.execute("UPDATE cleanup_runs SET ended_utc=?,state=?,processed_files=?,deleted_files=?,quarantined_files=?,skipped_files=?,failed_files=?,reclaimed_bytes=? WHERE cleanup_run_id=?",(datetime.now(timezone.utc).isoformat(),state,processed,deleted,quarantined,skipped,failed,reclaimed,run_id))
+        connection.commit()
+        print(f"Cleanup complete: deleted={deleted:,} quarantined={quarantined:,} skipped={skipped:,} reclaimed={human_bytes(reclaimed)}")
+        return 0 if failed==0 else 1
+    finally:
+        connection.close()
 
 
 def run_scan(args: argparse.Namespace) -> int:
@@ -3360,6 +3795,8 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.cleanup:
+            return run_cleanup(args)
         return run_scan(args)
     except (ValueError, RuntimeError) as exc:
         print(f"Error: {safe_display(str(exc))}", file=sys.stderr)
